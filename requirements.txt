@@ -1,0 +1,26 @@
+# --- Core: LangChain agent loop (LangChain 1.x) ---
+langchain>=1.4,<2.0
+langgraph>=1.0,<2.0
+langchain-text-splitters>=1.1,<2.0   # document chunking for RAG
+
+# --- Model provider: Ollama ---
+langchain-ollama>=1.1,<2.0
+
+# --- UI ---
+gradio>=6.0,<7.0
+
+# --- Voice: speech-to-text (Google, online) ---
+SpeechRecognition>=3.14
+# Python 3.13+ removed audioop from the stdlib; SpeechRecognition needs it.
+audioop-lts>=0.2.2; python_version >= "3.13"
+
+# --- Voice: text-to-speech (Microsoft Edge neural voices, online) ---
+edge-tts>=7.0
+
+# --- Voice: continuous microphone capture (server side) ---
+sounddevice>=0.5
+numpy>=2.0
+
+# --- Tools ---
+ddgs>=9.0          # web search tool
+pypdf>=5.0         # PDF ingestion for RAG
