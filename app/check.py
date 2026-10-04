@@ -15,8 +15,37 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 BLOCK_SIGNATURE = "Application Control policy has blocked"
+
+#: Smart App Control modes, per HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy
+#: ``VerifiedAndReputablePolicyState`` (see Microsoft's App Control docs).
+SAC_STATES = {0: "Off", 1: "Enforce", 2: "Evaluation"}
+
+
+@lru_cache(maxsize=1)
+def sac_mode() -> tuple[int | None, str]:
+    """Smart App Control's current mode.
+
+    Returns ``(value, label)``; ``(None, "unknown")`` when it cannot be read.
+    Reading this is what lets the report say "Smart App Control" instead of
+    guessing at WDAC -- the two are different features with different fixes.
+    """
+    if sys.platform != "win32":
+        return None, "not Windows"
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\CI\Policy",
+        ) as key:
+            raw, _ = winreg.QueryValueEx(key, "VerifiedAndReputablePolicyState")
+        value = int(raw)
+    except OSError:
+        return None, "unknown"
+    return value, SAC_STATES.get(value, f"state {value}")
 
 #: (import name, what it is for)
 DEPENDENCIES: list[tuple[str, str]] = [
@@ -62,10 +91,22 @@ def _check_import(name: str, purpose: str) -> CheckResult:
         message = " ".join(str(exc).split())
         blocked = BLOCK_SIGNATURE in message or "DLL load failed" in message
         if blocked:
-            detail = (
-                "BLOCKED by Application Control (WDAC) - the package is "
-                "installed but its native code is not trusted by policy"
-            )
+            value, label = sac_mode()
+            if value == 1:
+                detail = (
+                    f"BLOCKED by Smart App Control ({label}) - unsigned native "
+                    "code is not trusted by policy"
+                )
+            elif value == 0:
+                detail = (
+                    "BLOCKED by an Application Control policy (Smart App Control "
+                    f"is {label}, so another code-integrity policy is enforcing)"
+                )
+            else:
+                detail = (
+                    f"BLOCKED by Application Control ({label}) - the package is "
+                    "installed but its native code is not trusted by policy"
+                )
         else:
             detail = f"not importable: {message[:220]}"
         return CheckResult(name, False, detail, blocked=blocked)
@@ -177,18 +218,35 @@ def environment_report() -> int:
     print(f"{len(failures)} problem(s) found.")
 
     if blocked:
+        value, label = sac_mode()
         print()
-        print("Root cause: Windows Application Control (WDAC) is enforcing code")
-        print("integrity and refuses to load UNSIGNED native extensions.")
         print("Packages affected:", ", ".join(sorted({r.name for r in blocked})))
         print()
-        print("This is a machine policy, not a project problem -- no Python code")
-        print("can work around it. Options:")
-        print("  1. Ask IT/admin to allow your Python installation (or add an")
-        print("     allow rule for extension modules from PyPI).")
-        print("  2. Run the project in WSL2 or a container, where Windows code")
-        print("     integrity policy does not apply to Linux binaries.")
-        print("  3. Run it on a machine without this policy.")
+        if value == 1:
+            print("Root cause: Windows Smart App Control is in Enforce mode. It")
+            print("permits code that is cloud-rated as safe or signed by a trusted")
+            print("CA, and blocks the rest -- which includes the UNSIGNED extension")
+            print("modules PyPI wheels ship (pydantic_core, numpy, _cffi_backend).")
+            print("Every native import above is installed and intact; policy is")
+            print("refusing to load them.")
+            print()
+            print("Smart App Control has no per-app exception, so the options are:")
+            print("  1. Windows Security -> App & browser control -> Smart App")
+            print("     Control -> Off (needs admin). Recent Windows updates let you")
+            print("     turn it back on afterwards, so this is no longer one-way.")
+            print("  2. Run the project in WSL2 or a container: Smart App Control")
+            print("     governs Windows images, not Linux binaries.")
+            print("  3. Run it on a machine where the policy is not enforcing.")
+        else:
+            print(f"Root cause: a code-integrity policy (Smart App Control: {label})")
+            print("is enforcing and refuses to load UNSIGNED native extensions.")
+            print("This is a machine policy, not a project problem -- no Python code")
+            print("can work around it. Options:")
+            print("  1. Ask IT/admin to allow your Python installation (or add an")
+            print("     allow rule for extension modules from PyPI).")
+            print("  2. Run the project in WSL2 or a container, where Windows code")
+            print("     integrity policy does not apply to Linux binaries.")
+            print("  3. Run it on a machine without this policy.")
 
     return 1
 

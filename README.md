@@ -64,10 +64,10 @@ python run.py --check
 
 This imports every dependency for real and probes Ollama, the microphone and
 the two network services the voice path needs. It distinguishes a **missing**
-package from a **blocked** one — on a machine with Windows Application Control
-(WDAC) enforcing code integrity, unsigned native extensions such as
-`pydantic_core`, `numpy` and `cffi` are refused at load time and the report
-says so explicitly, with the options available to you.
+package from a **blocked** one — if Windows Smart App Control is enforcing,
+the unsigned native extensions that PyPI wheels ship (`pydantic_core`,
+`numpy`, `_cffi_backend`) are refused at load time, and the report says so
+explicitly, naming the policy and listing the options available to you.
 
 Expected output when everything is fine ends with:
 
@@ -214,14 +214,27 @@ out: Google speech recognition (microphone audio), Edge TTS (the text of your
 reply), and DuckDuckGo when `web_search` is called. Turn spoken replies off in
 the **Voice** tab if you would rather not send reply text for synthesis.
 
-### Windows Application Control (WDAC)
+### Windows Smart App Control
 
-If `python run.py --check` reports packages as `BLOCKED`, Windows is refusing
-to load unsigned native extensions from your Python installation. That is a
-machine policy, not a bug in this project — no Python code can work around it.
-Your options are to have an administrator allow your Python installation, run
-the project under WSL2 or a container where the policy does not apply to Linux
-binaries, or run it on a machine without the policy.
+If `python run.py --check` reports packages as `BLOCKED`, **Smart App Control**
+is enforcing: it allows code that is cloud-rated as safe or signed by a trusted
+CA, and blocks everything else — which includes the unsigned extension modules
+PyPI wheels ship. Every package is installed and intact; policy is refusing to
+load it. This is a machine setting, not a bug in this project, and there is no
+per-app exception.
+
+Your options:
+
+1. **Turn it off** — Windows Security → App & browser control → Smart App
+   Control → Off. Needs admin rights. Recent Windows updates let you turn it
+   back on afterwards, so this is no longer a one-way decision.
+2. **Run under WSL2 or a container** — Smart App Control governs Windows
+   images, not Linux binaries, so the whole stack runs untouched.
+3. **Run it on a machine** where the policy is not enforcing.
+
+Turning it off directly in the registry (`VerifiedAndReputablePolicyState`)
+is documented by Microsoft for testing only and can leave the machine blocking
+its own system applications — use the Windows Security toggle instead.
 
 ---
 
@@ -237,4 +250,4 @@ binaries, or run it on a machine without the policy.
 | `Speech recognition failed` repeatedly | The listener stops after 5 consecutive failures to avoid spinning; restart it with the mic button |
 | No spoken replies | Check the network, or untick **Speak replies aloud** |
 | `pip.exe` is blocked | Use `python -m pip` instead |
-| Native imports fail | Run `python run.py --check` |
+| Native imports fail / "Application Control has blocked this file" | Run `python run.py --check`; likely Smart App Control — see *Windows Smart App Control* above |
