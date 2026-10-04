@@ -86,12 +86,10 @@ def _docs_status_text(assistant: Assistant) -> str:
 def _tools_status_text(assistant: Assistant) -> str:
     """The toolset the agent can call, shown so it is visible not implied."""
     try:
-        from .agent import supported_tool_names
         from .tools.registry import build_tools
 
-        names = supported_tool_names(
-            build_tools(assistant.store, assistant.workspace, assistant.settings)
-        )
+        tools = build_tools(assistant.store, assistant.workspace, assistant.settings)
+        names = [getattr(tool, "name", str(tool)) for tool in tools]
     except Exception as exc:  # noqa: BLE001 - stack may be unavailable
         reason = " ".join(str(exc).split())[:150] or type(exc).__name__
         return f"🧰 Tools unavailable: {reason}"
