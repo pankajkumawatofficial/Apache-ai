@@ -95,6 +95,8 @@ def _voice_status_text(listener: WakeListener) -> str:
     # Capture health. Every one of these used to be silently swallowed, which
     # made "the microphone is not working" undiagnosable from the UI.
     notes = []
+    if info.get("capture_errors"):
+        notes.append(f"⚠ {info['capture_errors']} audio block error(s)")
     if info.get("xruns"):
         notes.append(f"⚠ {info['xruns']} audio overrun(s)")
     if info.get("dropped_blocks"):
@@ -103,6 +105,10 @@ def _voice_status_text(listener: WakeListener) -> str:
         notes.append(f"· {info['ignored']} utterance(s) ignored while busy")
     if info.get("queued"):
         notes.append(f"· {info['queued']} awaiting transcription")
+    # A live meter pinned at zero while supposedly listening means the mic is
+    # muted or we opened the wrong device -- worth saying, not leaving implied.
+    if state == "listening" and info.get("level", 0.0) <= 0.0:
+        notes.append("⚠ no signal reaching the microphone")
     if notes:
         lines.append("\n" + " · ".join(notes))
     return "\n".join(lines)

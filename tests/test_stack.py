@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -318,7 +319,7 @@ def test_listener_diagnostics() -> None:
     check("no device line is shown before the mic is opened",
           "Hz" not in text, _short(text, 160))
 
-    # Mutemust not need a stream to be safe -- it runs from the TTS callback.
+    # Mute must not need a stream to be safe -- it runs from the TTS callback.
     listener.mute_for(0)
     listener.mute_for(-5)
     listener.unmute()
@@ -327,6 +328,70 @@ def test_listener_diagnostics() -> None:
     check("stop is safe on a listener that never started",
           listener.stop() == "Microphone is off.",
           repr(_short(listener.stop(), 80)))
+
+
+def test_capture_feeds_vad() -> None:
+    """The capture loop must actually hand audio to the VAD.
+
+    Regression guard. ``_note_level`` was decorated ``@staticmethod`` while its
+    body referenced ``self``, so every call raised NameError. The capture loop
+    wrapped the batch in ``except Exception: continue``, which swallowed it --
+    audio was consumed and discarded, the VAD never saw a frame, and the gate
+    sat unmoved at its initial 0.042 forever. Listening simply did nothing,
+    with no error surfaced anywhere.
+
+    Both assertions are needed: either one alone would have passed on the
+    broken build.
+    """
+    from app.voice.listener import WakeListener
+    from app.voice.vad import EnergyVAD
+
+    listener = WakeListener(on_command=lambda _text: None)
+
+    raised = None
+    try:
+        listener._note_level([0.5, -0.5, 0.5, -0.5])
+    except Exception as exc:  # noqa: BLE001
+        raised = exc
+    check("_note_level does not raise when called as a method",
+          raised is None, repr(raised))
+    check("level meter reads the block it was given",
+          listener.status()["level"] > 0.0,
+          f"level={listener.status()['level']}")
+
+    # Drive the real loop with silence: the noise floor adapts downward, so
+    # the gate must fall below its starting value. If no frame reaches the VAD
+    # the threshold never moves -- exactly the reported symptom.
+    vad = EnergyVAD(sample_rate=16_000, frame_ms=30,
+                    min_energy=0.012, multiplier=3.5)
+    gate_before = vad.threshold
+
+    with listener._lock:
+        listener._running = True
+        listener._vad = vad
+        listener._pending.clear()
+        for _ in range(40):
+            listener._pending.append([0.0] * 480)
+
+    worker = threading.Thread(target=listener._capture_loop, daemon=True)
+    worker.start()
+    deadline = time.time() + 3.0
+    while time.time() < deadline and vad.threshold >= gate_before:
+        time.sleep(0.05)
+    with listener._lock:
+        listener._running = False
+    worker.join(timeout=2.0)
+
+    check("capture loop delivers audio to the VAD", vad.threshold < gate_before,
+          f"gate {gate_before:.5f} -> {vad.threshold:.5f} (never moved)")
+    check("capture loop records no block errors",
+          listener.status()["capture_errors"] == 0,
+          f"errors={listener.status()['capture_errors']}")
+    # The meter decays rather than snapping to zero, so loud audio is visible
+    # for a moment after it stops. It must fall, not sit pinned at 0.5.
+    check("level decays once the loud audio stops",
+          listener.status()["level"] < 0.5,
+          f"level={listener.status()['level']}")
 
 
 def main() -> int:
@@ -351,6 +416,7 @@ def main() -> int:
         test_snapshot_rendering,
         test_agent_turn_degrades_cleanly,
         test_listener_diagnostics,
+        test_capture_feeds_vad,
         # Kept last: it resets the shared conversation.
         test_stop_path,
     ):

@@ -91,6 +91,7 @@ class WakeListener:
         self._dropped_blocks = 0
         self._xruns = 0
         self._ignored_utterances = 0
+        self._capture_errors = 0
         self._level = 0.0
 
     # ------------------------------------------------------------------
@@ -116,6 +117,7 @@ class WakeListener:
                 "dropped_blocks": self._dropped_blocks,
                 "xruns": self._xruns,
                 "ignored": self._ignored_utterances,
+                "capture_errors": self._capture_errors,
                 "queued": len(self._utterances),
             }
 
@@ -170,6 +172,7 @@ class WakeListener:
             self._dropped_blocks = 0
             self._xruns = 0
             self._ignored_utterances = 0
+            self._capture_errors = 0
             self._level = 0.0
             self._stt_failures = 0
             self._running = True
@@ -292,7 +295,11 @@ class WakeListener:
             try:
                 for block in blocks:
                     self._note_level(block)
-                    utterances.extend(vad.feed(block))
+                    try:
+                        utterances.extend(vad.feed(block))
+                    except Exception:  # noqa: BLE001 - one bad block, not all
+                        with self._lock:
+                            self._capture_errors += 1
             except Exception:  # noqa: BLE001 - a bad block must not kill audio
                 continue
 
@@ -303,9 +310,13 @@ class WakeListener:
                 for utterance in utterances:
                     self._utterances.append(utterance)
 
-    @staticmethod
-    def _note_level(block: Any) -> None:
-        """Track the loudest recent block so the UI can show a live meter."""
+    def _note_level(self, block: Any) -> None:
+        """Track the loudest recent block so the UI can show a live meter.
+
+        Entirely self-contained: it must never raise, because it runs inside
+        the capture loop and an exception there used to abort the whole batch
+        -- audio was consumed and never reached the VAD.
+        """
         try:
             if len(block) == 0:
                 return
@@ -315,10 +326,13 @@ class WakeListener:
             rms = (total / len(block)) ** 0.5
         except Exception:  # noqa: BLE001 - display only, never fatal
             return
-        with self._lock:
-            # Decay rather than snap, so a single loud frame does not pin the
-            # meter at full scale for the rest of the utterance.
-            self._level = max(rms, self._level * 0.9)
+        try:
+            with self._lock:
+                # Decay rather than snap, so a single loud frame does not pin
+                # the meter at full scale for the rest of the utterance.
+                self._level = max(rms, self._level * 0.9)
+        except Exception:  # noqa: BLE001 - pragma: no cover
+            pass
 
     # ------------------------------------------------------------------
     # Stage 3: pipeline (recognition + the agent turn)
