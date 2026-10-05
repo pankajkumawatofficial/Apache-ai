@@ -47,6 +47,24 @@ _HEADER = """\
 # ---------------------------------------------------------------------------
 # Small formatting helpers
 # ---------------------------------------------------------------------------
+def _level_meter(level: float, threshold: float, width: int = 18) -> str:
+    """A one-line bar showing input level against the VAD gate.
+
+    When someone says "it isn't hearing me" the useful question is whether the
+    microphone is delivering signal at all and where the gate sits, which is
+    otherwise invisible.
+    """
+    if threshold <= 0:
+        return ""
+    filled = max(0, min(width, int(round(level / threshold * width))))
+    gate = max(0, min(width, int(round(threshold / max(threshold, 1e-9) * width))))
+    # 's' marks speech-level, '|' marks the gate. Simpler and more legible in
+    # a monospace span than trying to draw the gate inside the bar.
+    bar = "█" * filled + "·" * (width - filled)
+    verdict = "over gate" if level >= threshold else "below gate"
+    return f"`{bar}` {level:.4f} / {threshold:.4f} ({verdict})"
+
+
 def _voice_status_text(listener: WakeListener) -> str:
     info = listener.status()
     state = info["state"]
@@ -65,6 +83,28 @@ def _voice_status_text(listener: WakeListener) -> str:
         f"\nWake word: **{info['wake_word']}**"
         + (" · _muted while speaking_" if info["muted"] else "")
     )
+
+    if info.get("sample_rate"):
+        lines.append(
+            f"\n{_level_meter(info.get('level', 0.0), info.get('threshold', 0.0))}"
+        )
+        lines.append(
+            f"`{info['device']}` · {info['sample_rate']} Hz"
+        )
+
+    # Capture health. Every one of these used to be silently swallowed, which
+    # made "the microphone is not working" undiagnosable from the UI.
+    notes = []
+    if info.get("xruns"):
+        notes.append(f"⚠ {info['xruns']} audio overrun(s)")
+    if info.get("dropped_blocks"):
+        notes.append(f"⚠ {info['dropped_blocks']} buffer overrun(s)")
+    if info.get("ignored"):
+        notes.append(f"· {info['ignored']} utterance(s) ignored while busy")
+    if info.get("queued"):
+        notes.append(f"· {info['queued']} awaiting transcription")
+    if notes:
+        lines.append("\n" + " · ".join(notes))
     return "\n".join(lines)
 
 
@@ -107,6 +147,7 @@ def _settings_status_text(assistant: Assistant, ollama: Any = None) -> str:
     return (
         f"{head}\n\n"
         f"Model: `{assistant.model}` · temperature `{assistant.temperature}` · "
+        f"thinking `{'on' if assistant.reasoning else 'off'}` · "
         f"RAG `{assistant.store.status()['mode']}`\n\n"
         f"{_tools_status_text(assistant)}"
     )
@@ -152,9 +193,14 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
                 activity = gr.Textbox(
                     value="",
                     label="Agent activity (tool calls)",
-                    lines=7,
+                    lines=5,
                     interactive=False,
                     max_lines=12,
+                    placeholder=(
+                        "Tool calls stream here while the agent works, e.g.\n"
+                        "  → calculator(expression=1739 * 42)\n"
+                        "    calculator: 73038"
+                    ),
                 )
                 with gr.Row():
                     msg = gr.Textbox(
@@ -164,7 +210,17 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
                         show_label=False,
                         autofocus=True,
                     )
-                    send = gr.Button("Send", variant="primary", scale=1, min_width=110)
+                    send = gr.Button(
+                        "Send", variant="primary", scale=1, min_width=110
+                    )
+                    stop = gr.Button(
+                        "Stop",
+                        variant="stop",
+                        scale=1,
+                        min_width=90,
+                        # Enabled only while a turn is actually running.
+                        interactive=False,
+                    )
                 voice_audio = gr.Audio(
                     value=None,
                     label="Voice reply",
@@ -226,6 +282,15 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
                             label="Temperature",
                             info="Lower is more deterministic.",
                         )
+                        reasoning = gr.Checkbox(
+                            value=assistant.reasoning,
+                            label="Think before answering",
+                            info=(
+                                "Chain-of-thought. More careful, but measured "
+                                "6.9x slower end-to-end on this machine -- leave "
+                                "off for voice."
+                            ),
+                        )
                         system_prompt = gr.Textbox(
                             value=assistant.system_prompt,
                             label="System prompt",
@@ -257,6 +322,7 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
         def on_tick(last_audio: Any) -> tuple:
             messages, act, audio, stat = _render(assistant.snapshot())
             audio_out = audio if audio != last_audio else gr.skip()
+            busy = assistant.busy
             return (
                 messages,
                 act,
@@ -264,7 +330,16 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
                 stat,
                 _voice_status_text(listener),
                 audio,
+                # Stop only makes sense mid-turn; Send is greyed out so a
+                # second click cannot race the busy flag.
+                gr.update(interactive=busy),
+                gr.update(interactive=not busy),
             )
+
+        def on_stop() -> tuple:
+            assistant.request_stop()
+            messages, _act, _audio, stat = assistant.snapshot()
+            return messages, gr.skip(), stat
 
         def on_mic() -> tuple:
             if listener.running:
@@ -294,6 +369,7 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
             speak_value: bool,
             voice_value: str,
             wake_value: str,
+            reasoning_value: bool,
         ) -> tuple:
             word = (wake_value or "").strip().lower() or settings.wake_word
             settings.wake_word = word
@@ -306,16 +382,24 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
                 system_prompt=prompt_value,
                 speak_replies=speak_value,
                 voice=(voice_value or "").strip() or assistant.voice,
+                reasoning=bool(reasoning_value),
             )
             return (*_render(snapshot), _settings_status_text(assistant))
 
         def on_load() -> tuple:
             status = check_ollama()
+            running = listener.running
             return (
                 _settings_status_text(assistant, status),
                 gr.update(choices=status.choices, value=assistant.model),
                 _docs_status_text(assistant),
                 _voice_status_text(listener),
+                # A refresh must not leave the button claiming the mic is off
+                # while the listener is still running in this process.
+                gr.update(
+                    value="Stop listening" if running else "Start listening",
+                    variant="stop" if running else "primary",
+                ),
             )
 
         send.click(
@@ -335,10 +419,20 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
         timer.tick(
             on_tick,
             inputs=audio_state,
-            outputs=[chatbot, activity, voice_audio, status, voice_status, audio_state],
+            outputs=[
+                chatbot,
+                activity,
+                voice_audio,
+                status,
+                voice_status,
+                audio_state,
+                stop,
+                send,
+            ],
         )
 
         mic_button.click(on_mic, outputs=[voice_status, mic_button])
+        stop.click(on_stop, outputs=[chatbot, voice_audio, status])
         files.upload(on_ingest, inputs=files,
                      outputs=[chatbot, activity, voice_audio, status, docs_status])
         clear_docs.click(on_clear_docs,
@@ -347,10 +441,13 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
                          outputs=[chatbot, activity, voice_audio, status, voice_status])
         apply.click(
             on_apply,
-            inputs=[model, temperature, system_prompt, speak, voice, wake],
+            inputs=[model, temperature, system_prompt, speak, voice, wake, reasoning],
             outputs=[chatbot, activity, voice_audio, status, settings_status],
         )
-        demo.load(on_load, outputs=[settings_status, model, docs_status, voice_status])
+        demo.load(
+            on_load,
+            outputs=[settings_status, model, docs_status, voice_status, mic_button],
+        )
 
     return demo
 

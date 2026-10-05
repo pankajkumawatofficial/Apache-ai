@@ -57,6 +57,7 @@ def build_chat_model(
     model: str | None = None,
     temperature: float | None = None,
     base_url: str | None = None,
+    reasoning: bool | None = None,
 ):
     """Construct a ``ChatOllama``. Imported lazily to keep startup cheap."""
     from langchain_ollama import ChatOllama
@@ -66,6 +67,10 @@ def build_chat_model(
         base_url=(base_url or settings.ollama_base_url).rstrip("/"),
         temperature=settings.temperature if temperature is None else temperature,
         num_ctx=settings.num_ctx,
+        # Left as None, Ollama applies the model's own default -- which for
+        # qwen3 is thinking ON, ~16x slower on CPU. Apache passes an explicit
+        # False unless the operator opted in with APACHE_REASONING=1.
+        reasoning=settings.reasoning if reasoning is None else reasoning,
         # Left off: it costs a network round trip on every rebuild, and the
         # first invoke surfaces a clearer error than a constructor would.
         validate_model_on_init=False,

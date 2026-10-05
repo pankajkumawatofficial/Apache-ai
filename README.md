@@ -143,7 +143,7 @@ app/
     wake.py                wake-word matching + speech text cleanup
     stt.py                 Google speech recognition
     tts.py                 edge-tts synthesis
-    listener.py            continuous microphone + wake-word worker
+    listener.py            three-stage capture: callback -> VAD -> pipeline
 data/
   uploads/  workspace/  audio/     created automatically at first run
 tests/
@@ -189,7 +189,28 @@ results. Node names come from LangChain 1.x's factory (`"model"`, `"tools"`).
 
 **Echo suppression.** The microphone mutes while a reply is playing, for the
 estimated duration of the speech plus a small buffer, so Apache does not
-transcribe itself.
+transcribe itself. While muted the VAD is skipped entirely rather than merely
+having its output discarded: its noise floor adapts from quiet frames, so
+feeding it loud TTS would walk the gate up until ordinary speech stopped
+crossing it — capture would get worse with every reply.
+
+**Capture never waits on the model.** The listener runs three stages on three
+threads: the PortAudio callback only copies samples, a capture worker only runs
+the VAD, and a separate pipeline worker does recognition and the agent turn.
+The pipeline is the stage that can block for a whole turn, which is exactly why
+it is not the one draining the microphone. When all three were one thread, a
+single spoken question stalled audio consumption, the block buffer overflowed,
+and anything said while Apache answered was silently lost.
+
+**Silent loss is reported.** PortAudio overrun flags, buffer overflows and
+utterances discarded because Apache was busy are all counted and shown in the
+voice panel, alongside a live input level against the current VAD gate. "It is
+not hearing me" becomes a readable diagnosis instead of a guess.
+
+**Stoppable turns.** Every agent event is checked against a stop flag, and the
+agent yields per token, so **Stop** takes effect in roughly one token. A
+stopped turn skips speech synthesis, leaves whatever partial text arrived and
+releases the busy flag immediately.
 
 **Retrieval degrades rather than breaks.** If `nomic-embed-text` is not
 pulled, or Ollama refuses the request, the store falls back to an in-process
@@ -246,6 +267,16 @@ Ollama, your documents and your files stay on your machine. Three things go
 out: Google speech recognition (microphone audio), Edge TTS (the text of your
 reply), and DuckDuckGo when `web_search` is called. Turn spoken replies off in
 the **Voice** tab if you would rather not send reply text for synthesis.
+
+### No barge-in: one spoken command at a time
+
+While Apache is recognising or answering, the microphone keeps running — but
+speech captured in that window is **discarded**, not queued. It would be worse
+to execute a command two minutes after it was spoken, so the voice panel counts
+the ignored utterances and shows them.
+
+Typed input has the same rule: a second message while a turn is running is
+refused rather than queued. Press **Stop** first if you want to change course.
 
 ### It is only as fast as your hardware
 

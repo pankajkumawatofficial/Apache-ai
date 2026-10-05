@@ -127,19 +127,27 @@ class AgentRunner:
             self._tools_revision = revision
         return self._tools
 
-    def _agent(self, model: str, temperature: float, system_prompt: str):
+    def _agent(
+        self,
+        model: str,
+        temperature: float,
+        system_prompt: str,
+        reasoning: bool | None = None,
+    ):
         from langchain.agents import create_agent
 
         # Refresh the tool list first so the cache key reflects it.
         self.tools
-        key = (model, round(temperature, 3), system_prompt, self._tools_revision)
+        # reasoning belongs in the key: ChatOllama captures it at construction,
+        # so a key without it would reuse an agent built with the old mode.
+        key = (model, round(temperature, 3), system_prompt, self._tools_revision, reasoning)
 
         cached = self._agents.get(key)
         if cached is not None:
             return cached
 
         agent = create_agent(
-            build_chat_model(model=model, temperature=temperature),
+            build_chat_model(model=model, temperature=temperature, reasoning=reasoning),
             tools=self._tools or [],
             system_prompt=system_prompt or None,
             checkpointer=self._checkpointer,
@@ -167,12 +175,13 @@ class AgentRunner:
         model: str,
         temperature: float,
         system_prompt: str,
+        reasoning: bool | None = None,
     ) -> Iterator[AgentEvent]:
         """Run one turn, yielding events in the order the UI should show them."""
         from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 
         try:
-            graph = self._agent(model, temperature, system_prompt)
+            graph = self._agent(model, temperature, system_prompt, reasoning)
         except Exception as exc:
             yield AgentEvent("error", f"Could not build the agent: {_detail(exc)}")
             return

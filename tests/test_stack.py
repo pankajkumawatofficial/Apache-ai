@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
 
@@ -231,6 +232,103 @@ def test_agent_turn_degrades_cleanly() -> None:
               isinstance(status, str) and bool(status.strip()), repr(status))
 
 
+def test_stop_path() -> None:
+    """A turn in flight must be abandonable, and must release the busy flag.
+
+    The runner is stubbed so this never touches Ollama: the contract under
+    test is Apache's own turn machinery, and making it depend on a live model
+    would turn a fast deterministic check into a slow flaky one.
+    """
+    get_assistant, _, _, _ = _load_stack()
+    from app.agent import AgentEvent
+
+    assistant = get_assistant()
+
+    check("stop is a no-op when idle", assistant.request_stop() is False)
+
+    class _StubRunner:
+        """Yields slowly enough that a stop can land mid-stream."""
+
+        def stream(self, *_args, **_kwargs):
+            for index in range(200):
+                time.sleep(0.02)
+                yield AgentEvent("text", f"chunk {index}")
+
+        def reset_session(self, _session_id):  # pragma: no cover - unused here
+            return None
+
+    real_runner = assistant.runner
+    assistant.runner = _StubRunner()
+    try:
+        generator = assistant.submit("please ignore this, it is a test")
+        next(generator)  # reaches the first yield: the turn is now live
+
+        check("a live turn claims the busy flag", assistant.busy)
+        check("request_stop reports there was something to stop",
+              assistant.request_stop() is True)
+
+        last = None
+        for snap in generator:
+            last = snap
+
+        check("stopped turn yields a final snapshot", last is not None)
+        if last is not None:
+            _messages, _activity, _audio, status = last
+            check("stopped turn reports Stopped.",
+                  status == "Stopped.", repr(status))
+        check("stopped turn releases the busy flag", not assistant.busy)
+        check("stop flag is cleared for the next turn",
+              assistant.request_stop() is False)
+    finally:
+        assistant.runner = real_runner
+        assistant.reset()
+
+
+def test_listener_diagnostics() -> None:
+    """Capture health must be visible, not silently swallowed.
+
+    The original listener discarded PortAudio overflow flags, buffer drops and
+    ignored utterances without recording them anywhere, which made "the
+    microphone is not working" impossible to diagnose from the UI.
+    """
+    _, _, ui, _ = _load_stack()
+    from app.voice.listener import WakeListener
+
+    heard: list[str] = []
+    listener = WakeListener(on_command=heard.append)
+    info = listener.status()
+
+    required = (
+        "state", "message", "transcript", "sample_rate", "device", "muted",
+        "wake_word", "level", "threshold", "dropped_blocks", "xruns",
+        "ignored", "queued",
+    )
+    missing = [key for key in required if key not in info]
+    check("listener status exposes capture health", not missing,
+          f"missing={missing}")
+    check("listener reports a threshold for the meter",
+          isinstance(info["threshold"], float))
+    check("listener starts stopped", info["state"] == "stopped")
+    check("listener does not report itself running", listener.running is False)
+
+    text = ui._voice_status_text(listener)
+    check("_voice_status_text renders an idle listener",
+          isinstance(text, str) and "Microphone is off" in text,
+          _short(text, 160))
+    check("no device line is shown before the mic is opened",
+          "Hz" not in text, _short(text, 160))
+
+    # Mutemust not need a stream to be safe -- it runs from the TTS callback.
+    listener.mute_for(0)
+    listener.mute_for(-5)
+    listener.unmute()
+    check("mute/unmute are safe without a microphone", True)
+
+    check("stop is safe on a listener that never started",
+          listener.stop() == "Microphone is off.",
+          repr(_short(listener.stop(), 80)))
+
+
 def main() -> int:
     print("Apache stack tests")
     print("-" * 64)
@@ -252,6 +350,9 @@ def main() -> int:
         test_status_helpers,
         test_snapshot_rendering,
         test_agent_turn_degrades_cleanly,
+        test_listener_diagnostics,
+        # Kept last: it resets the shared conversation.
+        test_stop_path,
     ):
         print(f"-- {suite.__name__}")
         try:

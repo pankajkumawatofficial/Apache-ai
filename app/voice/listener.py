@@ -1,12 +1,25 @@
 """Continuous microphone listening with wake-word detection.
 
-A ``sounddevice`` callback drops each block of samples on a list; a worker
-thread runs them through the energy VAD, transcribes anything that looks like
-speech, and -- if the transcript opens with the wake word -- hands the
-remaining instruction to the assistant.
+Three stages, deliberately kept apart so no stage can stall capture:
 
-The listener deliberately owns no conversation state: it only calls
-``on_command(text)`` and reports its own status for the UI to display.
+1. **PortAudio callback** -- copies each block onto a deque and returns. It
+   never does I/O and never raises.
+2. **Capture worker** -- drains that deque through the energy VAD. Pure CPU,
+   microseconds per block, so the microphone is always drained in time.
+3. **Pipeline worker** -- recognises completed utterances and runs the matched
+   command. This is the only stage that touches the network or the model, and
+   it can block for a whole agent turn (tens of seconds on CPU), which is
+   exactly why it must not be the thread that drains the microphone.
+
+Before this split the pipeline ran inline in the capture worker, so a single
+spoken question stalled audio consumption: the 64-block ring filled, the
+oldest audio was silently dropped, and whatever the user said while Apache
+answered was lost. Worse, the VAD kept being fed the text-to-speech playback,
+which walked the adaptive noise floor up until ordinary speech no longer
+crossed the gate -- capture degraded more with every reply.
+
+The listener owns no conversation state: it only calls ``on_command(text)``
+and reports its own status for the UI to display.
 """
 
 from __future__ import annotations
@@ -21,13 +34,23 @@ from ..config import Settings, settings as default_settings
 from .vad import EnergyVAD
 from .wake import match_wake
 
-__all__ = ["WakeListener", "WakeOnlyPrompt"]
+__all__ = ["WakeListener", "WAKE_ONLY_PROMPT"]
 
 #: What the assistant is told when the wake word arrives with no instruction.
 WAKE_ONLY_PROMPT = (
     "I just said your wake word but gave no instruction. "
     "Reply with a brief greeting and ask what you can help with."
 )
+
+#: PortAudio blocks held while the capture worker catches up. At the default
+#: 30 ms frame this is ~1.9 s of audio -- a ceiling, not a target; the worker
+#: normally empties it every 20 ms.
+_MAX_PENDING_BLOCKS = 64
+
+#: Completed utterances held while the recogniser is busy. Small on purpose:
+#: speech captured *during* an answer is stale by the time we could act on it,
+#: so we would rather discard it and say so than replay it minutes later.
+_MAX_UTTERANCES = 4
 
 
 class WakeListener:
@@ -48,7 +71,9 @@ class WakeListener:
 
         self._lock = threading.RLock()
         self._pending: deque[Any] = deque()
-        self._thread: threading.Thread | None = None
+        self._utterances: deque[Any] = deque(maxlen=_MAX_UTTERANCES)
+        self._capture_thread: threading.Thread | None = None
+        self._pipeline_thread: threading.Thread | None = None
         self._stream: Any = None
         self._vad: EnergyVAD | None = None
         self._running = False
@@ -60,6 +85,13 @@ class WakeListener:
         self._rate = 0
         self._device_name = ""
         self._stt_failures = 0
+
+        # Diagnostics. Silent loss is the hardest kind of failure to debug, so
+        # every counter that would otherwise be invisible is surfaced in the UI.
+        self._dropped_blocks = 0
+        self._xruns = 0
+        self._ignored_utterances = 0
+        self._level = 0.0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -78,10 +110,17 @@ class WakeListener:
                 "device": self._device_name,
                 "muted": time.time() < self._muted_until,
                 "wake_word": self.settings.wake_word,
+                # Capture health.
+                "level": self._level,
+                "threshold": self._vad.threshold if self._vad is not None else 0.0,
+                "dropped_blocks": self._dropped_blocks,
+                "xruns": self._xruns,
+                "ignored": self._ignored_utterances,
+                "queued": len(self._utterances),
             }
 
     def start(self) -> str:
-        """Open the microphone and start the worker. Returns a status line."""
+        """Open the microphone and start both workers. Returns a status line."""
         with self._lock:
             if self._running:
                 return self._message
@@ -127,6 +166,12 @@ class WakeListener:
             self._rate = rate
             self._device_name = device_name
             self._pending.clear()
+            self._utterances.clear()
+            self._dropped_blocks = 0
+            self._xruns = 0
+            self._ignored_utterances = 0
+            self._level = 0.0
+            self._stt_failures = 0
             self._running = True
             self._state = "listening"
             self._message = (
@@ -134,19 +179,25 @@ class WakeListener:
                 f'Say "{self.settings.wake_word}" to ask something.'
             )
 
-        self._thread = threading.Thread(
-            target=self._worker, name="apache-listener", daemon=True
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop, name="apache-capture", daemon=True
         )
-        self._thread.start()
+        self._pipeline_thread = threading.Thread(
+            target=self._pipeline_loop, name="apache-pipeline", daemon=True
+        )
+        self._capture_thread.start()
+        self._pipeline_thread.start()
         return self._message
 
     def stop(self) -> str:
-        """Close the microphone and stop the worker."""
+        """Close the microphone and stop both workers."""
         with self._lock:
             if not self._running:
                 return self._message or "Microphone is off."
             self._running = False
             stream, self._stream = self._stream, None
+            capture, self._capture_thread = self._capture_thread, None
+            pipeline, self._pipeline_thread = self._pipeline_thread, None
 
         try:
             if stream is not None:
@@ -155,17 +206,20 @@ class WakeListener:
         except Exception:  # noqa: BLE001 - already closed
             pass
 
-        thread, self._thread = self._thread, None
-        # Never join ourselves: the worker reports an error by calling stop().
-        if (
-            thread is not None
-            and thread.is_alive()
-            and thread is not threading.current_thread()
-        ):
-            thread.join(timeout=2.0)
+        current = threading.current_thread()
+        for thread in (capture, pipeline):
+            # Never join ourselves: the pipeline reports recogniser failures by
+            # calling stop() from its own thread.
+            if (
+                thread is not None
+                and thread.is_alive()
+                and thread is not current
+            ):
+                thread.join(timeout=2.0)
 
         with self._lock:
             self._pending.clear()
+            self._utterances.clear()
             self._state = "stopped"
             self._message = "Microphone is off."
         return self._message
@@ -176,55 +230,41 @@ class WakeListener:
             return
         with self._lock:
             self._muted_until = max(self._muted_until, time.time() + seconds)
+            # Anything already segmented was captured before playback started;
+            # it is about to become stale anyway, so drop it rather than have
+            # the pipeline answer something we are currently saying out loud.
+            self._ignored_utterances += len(self._utterances)
+            self._utterances.clear()
 
     def unmute(self) -> None:
         with self._lock:
             self._muted_until = 0.0
 
     # ------------------------------------------------------------------
-    # Internals
+    # Stage 1: PortAudio callback
     # ------------------------------------------------------------------
-    def _fail(self, message: str) -> str:
-        """Startup failure: there is no stream and no thread to tear down."""
-        with self._lock:
-            self._running = False
-            self._state = "error"
-            self._message = message
-        self._notify_error(message)
-        return message
-
-    def _report_error(self, message: str) -> None:
-        """Runtime failure: the microphone stays open, only the status changes.
-
-        Using :meth:`_fail` here would set ``_running`` false without closing
-        the PortAudio stream, leaking the device.
-        """
-        with self._lock:
-            if self._running:
-                self._state = "error"
-                self._message = message
-        self._notify_error(message)
-
-    def _notify_error(self, message: str) -> None:
-        if self.on_error is not None:
-            try:
-                self.on_error(message)
-            except Exception:  # noqa: BLE001 - callbacks must not kill us
-                pass
-
     def _on_audio(self, indata: Any, frames: int, time_info: Any, status: Any) -> None:
-        """PortAudio callback. Must never raise."""
+        """PortAudio callback. Must never raise, must never block."""
         try:
+            if status:
+                # PortAudio raises this flag on overflow/underflow -- an xrun
+                # means real samples were lost, which is precisely the symptom
+                # of a consumer that fell behind. Count it instead of hiding it.
+                with self._lock:
+                    self._xruns += 1
             block = indata.copy().reshape(-1)
         except Exception:  # noqa: BLE001 - pragma: no cover
             return
         with self._lock:
             self._pending.append(block)
-            # Bound memory if the worker stalls for any reason.
-            while len(self._pending) > 64:
+            while len(self._pending) > _MAX_PENDING_BLOCKS:
                 self._pending.popleft()
+                self._dropped_blocks += 1
 
-    def _worker(self) -> None:
+    # ------------------------------------------------------------------
+    # Stage 2: capture worker (drains the microphone, never blocks)
+    # ------------------------------------------------------------------
+    def _capture_loop(self) -> None:
         while True:
             with self._lock:
                 if not self._running:
@@ -232,14 +272,26 @@ class WakeListener:
                 blocks = list(self._pending)
                 self._pending.clear()
                 vad = self._vad
+                muted = time.time() < self._muted_until
 
             if not blocks or vad is None:
                 time.sleep(0.02)
                 continue
 
+            if muted:
+                # Do NOT feed the VAD while the reply plays. Its noise floor
+                # adapts from quiet frames, so letting loud TTS through would
+                # walk the threshold up until the next real utterance never
+                # trips it -- capture degrades with every reply.
+                vad.reset()
+                with self._lock:
+                    self._level = 0.0
+                continue
+
             utterances = []
             try:
                 for block in blocks:
+                    self._note_level(block)
                     utterances.extend(vad.feed(block))
             except Exception:  # noqa: BLE001 - a bad block must not kill audio
                 continue
@@ -248,20 +300,57 @@ class WakeListener:
                 continue
 
             with self._lock:
-                muted = time.time() < self._muted_until
-            if muted:
-                # We are mid-playback; transcribing our own voice would loop.
-                continue
+                for utterance in utterances:
+                    self._utterances.append(utterance)
 
-            for utterance in utterances:
+    @staticmethod
+    def _note_level(block: Any) -> None:
+        """Track the loudest recent block so the UI can show a live meter."""
+        try:
+            if len(block) == 0:
+                return
+            total = 0.0
+            for sample in block:
+                total += float(sample) * float(sample)
+            rms = (total / len(block)) ** 0.5
+        except Exception:  # noqa: BLE001 - display only, never fatal
+            return
+        with self._lock:
+            # Decay rather than snap, so a single loud frame does not pin the
+            # meter at full scale for the rest of the utterance.
+            self._level = max(rms, self._level * 0.9)
+
+    # ------------------------------------------------------------------
+    # Stage 3: pipeline (recognition + the agent turn)
+    # ------------------------------------------------------------------
+    def _pipeline_loop(self) -> None:
+        while True:
+            with self._lock:
                 if not self._running:
                     return
-                self._handle_utterance(utterance)
+                utterance = self._utterances.popleft() if self._utterances else None
+
+            if utterance is None:
+                time.sleep(0.03)
+                continue
+
+            self._handle_utterance(utterance)
+
+            # Whatever arrived while we were recognising or answering is stale.
+            # Replaying a command two minutes after it was spoken is worse than
+            # dropping it, so drop it -- visibly.
+            with self._lock:
+                stale = len(self._utterances)
+                if stale:
+                    self._ignored_utterances += stale
+                    self._utterances.clear()
 
     def _handle_utterance(self, utterance: Any) -> None:
         from . import stt
 
         with self._lock:
+            if not self._running:
+                return
             self._state = "transcribing"
 
         try:
@@ -291,10 +380,10 @@ class WakeListener:
                 return
 
             self._state = "command"
-            if command:
-                self._message = f'Command: "{command}"'
-            else:
-                self._message = "Wake word detected."
+            self._message = (
+                f'Command: "{command}" — answering now. '
+                "Anything said until the reply finishes is ignored."
+            )
 
         payload = command.strip() or WAKE_ONLY_PROMPT
         try:
@@ -304,6 +393,8 @@ class WakeListener:
             return
 
         with self._lock:
+            if not self._running:
+                return
             self._state = "listening"
             self._message = (
                 f'Heard "{transcript}". '
@@ -328,3 +419,34 @@ class WakeListener:
                 "stopping the microphone. Typing still works."
             )
             self.stop()
+
+    # ------------------------------------------------------------------
+    # Errors
+    # ------------------------------------------------------------------
+    def _fail(self, message: str) -> str:
+        """Startup failure: there is no stream and no worker to tear down."""
+        with self._lock:
+            self._running = False
+            self._state = "error"
+            self._message = message
+        self._notify_error(message)
+        return message
+
+    def _report_error(self, message: str) -> None:
+        """Runtime failure: the microphone stays open, only the status changes.
+
+        Using :meth:`_fail` here would set ``_running`` false without closing
+        the PortAudio stream, leaking the device.
+        """
+        with self._lock:
+            if self._running:
+                self._state = "error"
+                self._message = message
+        self._notify_error(message)
+
+    def _notify_error(self, message: str) -> None:
+        if self.on_error is not None:
+            try:
+                self.on_error(message)
+            except Exception:  # noqa: BLE001 - callbacks must not kill us
+                pass

@@ -41,6 +41,15 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = _env(name, "1" if default else "0").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 # Google's speech API hears "Apache" as several plausible phrases; accept them
 # all so a mis-transcription does not silently drop the command.
 DEFAULT_WAKE_ALIASES: list[str] = ["apache", "a patch", "a path", "app patch"]
@@ -52,6 +61,9 @@ Communication rules — these matter because your replies are spoken aloud:
 - Be concise. One or two short sentences for a spoken answer whenever possible.
 - Never emit Markdown, code fences, bullet lists or tables in a spoken reply.
   Use plain prose. If code must be shown, put it on its own line and keep it short.
+- Never emit LaTeX or escape sequences: no $...$, no backslashes, no
+  \times or \frac. Write arithmetic in plain words instead
+  ("1739 times 42"), because the reply is read aloud by a synthesiser.
 - If a tool gives you a number or fact, state the result directly, not the reasoning.
 - If you do not know something and no tool can help, say so plainly.
 
@@ -78,6 +90,11 @@ class Settings:
     recursion_limit: int = _env_int("RECURSION_LIMIT", 24)
     # Context window handed to Ollama. RAG and long tool traces need room.
     num_ctx: int = _env_int("NUM_CTX", 8192)
+    # Chain-of-thought before the answer. qwen3-family models turn this ON by
+    # default when Ollama is not told otherwise, and on CPU-only hardware that
+    # measured 16x slower (83.5s vs 5.0s for "say hello in five words").
+    # Spoken replies are one or two sentences, so the reasoning buys little.
+    reasoning: bool = _env_bool("REASONING", False)
     system_prompt: str = _env("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 
     # --- voice -----------------------------------------------------------
