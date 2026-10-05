@@ -113,6 +113,8 @@ Every setting can be overridden with an `APACHE_`-prefixed environment variable
 | `APACHE_TTS_VOICE` | `en-US-AndrewMultilingualNeural` | edge-tts voice |
 | `APACHE_STT_LANGUAGE` | `en-US` | Google speech recognition language |
 | `APACHE_SILENCE_END_MS` | `1500` | Quiet that ends a spoken query (see below) |
+| `APACHE_VAD_MULTIPLIER` | `2.0` | How far above room noise speech must sit (see below) |
+| `APACHE_VAD_MIN_ENERGY` | `0.012` | Absolute floor, so a silent room never trips |
 | `APACHE_VAD_PRE_ROLL_MS` | `150` | Room tone kept before the first word |
 | `APACHE_VAD_KEEP_TAIL_MS` | `300` | Silence kept after the last word |
 | `APACHE_SANDBOX_TIMEOUT` | `20` | Seconds a `run_python` call may run |
@@ -209,6 +211,19 @@ and anything said while Apache answered was silently lost.
 utterances discarded because Apache was busy are all counted and shown in the
 voice panel, alongside a live input level against the current VAD gate. "It is
 not hearing me" becomes a readable diagnosis instead of a guess.
+
+**The gate sits above the room, not above your voice.** The speech gate is the
+noise floor times a multiplier, and at 3.5 it measured `0.0283` against a room
+level of `0.0073` -- 3.9x ambient, which an ordinary voice does not sustain
+for a whole sentence. Speech therefore only partly cleared it: the sentence
+fragmented at each dip, the opening clause reached the agent transcribed as
+"Apache RR", and three later pieces were discarded as too short. That is what
+"it is not taking my full input" looks like from inside the pipeline. The
+default is now `APACHE_VAD_MULTIPLIER=2.0`, the usual noise-gate ratio --
+speech clears it while room noise still has to double to trip it. The
+discarded-utterance counter is what makes this diagnosable at all: before it
+existed, a clipped word and a dead microphone produced exactly the same
+silence.
 
 **A query ends on silence, not on a breath.** The endpoint decides whether a
 pause mid-question is a breath or the end of the question. At 700 ms it fired

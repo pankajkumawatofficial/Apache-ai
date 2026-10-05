@@ -77,7 +77,7 @@ class EnergyVAD:
         sample_rate: int = 16_000,
         frame_ms: int = 30,
         min_energy: float = 0.012,
-        multiplier: float = 3.5,
+        multiplier: float = 2.0,
         silence_end_ms: int = 1500,
         min_utterance_ms: int = 350,
         max_utterance_s: float = 20.0,

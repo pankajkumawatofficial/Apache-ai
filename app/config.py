@@ -115,8 +115,17 @@ class Settings:
     utterance_min_ms: int = 350
     utterance_max_s: float = 20.0
     # Noise-gate: threshold = max(floor, noise_floor * multiplier).
+    #
+    # The multiplier is how far above room noise a signal must sit before it
+    # counts as speech. Measured live on this machine: room level 0.0073, gate
+    # 0.0283 -- 3.9x ambient, more than an ordinary voice sustains for a whole
+    # sentence. Speech therefore only partly cleared the gate, the sentence
+    # fragmented into pieces, the first reached the agent as "Apache RR" and
+    # three later pieces were discarded as too short. 2.0 is the usual
+    # noise-gate ratio: speech clears it, and room noise still has to double
+    # to trip it.
     vad_min_energy: float = _env_float("VAD_MIN_ENERGY", 0.012)
-    vad_multiplier: float = _env_float("VAD_MULTIPLIER", 3.5)
+    vad_multiplier: float = _env_float("VAD_MULTIPLIER", 2.0)
     # Context kept around the voiced span. Google's recogniser segments on
     # silence at both ends; an utterance cut hard at the first and last voiced
     # sample comes back as an empty string even when every word is audible.

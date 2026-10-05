@@ -15,6 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.config import settings                                        # noqa: E402
 from app.tools.calculator import CalcError, safe_eval          # noqa: E402
 from app.tools.files import (                                  # noqa: E402
     FileAccessError,
@@ -289,6 +290,89 @@ def test_vad() -> None:
     check("reset clears state", not vad2.listening and vad2.feed(silence) == [])
 
 
+def _gate_frame(rms: float, samples: int = 480) -> list[float]:
+    """One frame whose RMS is exactly *rms*. The VAD measures nothing else."""
+    return [rms, -rms] * (samples // 2) + [rms] * (samples % 2)
+
+
+def _gate_track(parts: list[tuple[float, float]]) -> list[float]:
+    """Build a signal from ``(seconds, rms)`` spans, cut into 30 ms frames."""
+    signal: list[float] = []
+    for seconds, rms in parts:
+        total = int(round(seconds * 16_000))
+        for start in range(0, total, 480):
+            signal.extend(_gate_frame(rms, min(480, total - start)))
+    return signal
+
+
+def _gate_run(signal: list[float], multiplier: float):
+    """Feed a signal through the production VAD configuration."""
+    vad = EnergyVAD(
+        sample_rate=16_000,
+        frame_ms=30,
+        min_energy=settings.vad_min_energy,
+        multiplier=multiplier,
+        silence_end_ms=settings.silence_end_ms,
+        min_utterance_ms=settings.utterance_min_ms,
+        max_utterance_s=settings.utterance_max_s,
+        pre_roll_ms=settings.vad_pre_roll_ms,
+        keep_tail_ms=settings.vad_keep_tail_ms,
+    )
+    utterances: list = []
+    for i in range(0, len(signal), 480):
+        utterances.extend(vad.feed(signal[i:i + 480]))
+    utterances.extend(vad.flush())
+    return utterances, vad
+
+
+def test_gate_multiplier() -> None:
+    """A spoken question must survive the gate without the room getting in."""
+    print("gate multiplier")
+
+    # Rebuilt from a live panel: room 0.0073, gate 0.0283 at the old
+    # multiplier of 3.5 -- 3.9x ambient, which an ordinary voice does not
+    # sustain across a whole sentence. Speech only partly cleared it, the
+    # question fragmented, and most of it was discarded as too short. These
+    # spans are that room in synthetic form; only the RMS matters to a VAD.
+    room = 0.008
+    spans = [
+        (2.0, room),           # lead-in while the noise floor settles
+        (0.6, 0.030),          # "apache", spoken with emphasis
+        (0.15, 0.009),         # natural inter-word gap
+        (2.25, 0.019),         # the question, conversational level
+        (0.15, 0.009),
+        (0.85, 0.021),         # the last clause
+        (3.0, room),           # trailing room so the endpoint can close
+    ]
+    spoken = sum(sec for sec, rms in spans if rms > 0.012)
+    signal = _gate_track(spans)
+
+    utterances, vad = _gate_run(signal, settings.vad_multiplier)
+    kept = sum(u.duration_s for u in utterances)
+    check("the configured gate keeps the question in one piece",
+          len(utterances) == 1, f"got {len(utterances)}")
+    check("nothing is discarded", vad.rejected_count == 0,
+          f"rejected={vad.rejected_count}")
+    check("the whole question is retained", kept >= spoken * 0.9,
+          f"kept {kept:.2f}s of {spoken:.2f}s spoken")
+
+    # What this replaced, kept in the suite so a regression is visible as the
+    # exact loss the user reported rather than as an abstract threshold.
+    old, _old_vad = _gate_run(signal, 3.5)
+    check("the old multiplier demonstrably lost the question",
+          sum(u.duration_s for u in old) < spoken * 0.6,
+          f"kept {sum(u.duration_s for u in old):.2f}s of {spoken:.2f}s")
+
+    # Lowering the gate must not have turned it into a hole: the room alone
+    # still has to stay quiet, and must not even be counted as a discard.
+    quiet, quiet_vad = _gate_run(_gate_track([(8.0, room)]),
+                                 settings.vad_multiplier)
+    check("pure room tone trips nothing", len(quiet) == 0,
+          f"got {len(quiet)}")
+    check("pure room tone is not counted as a discard",
+          quiet_vad.rejected_count == 0, f"rejected={quiet_vad.rejected_count}")
+
+
 def test_sandbox() -> None:
     print("sandbox")
     with tempfile.TemporaryDirectory() as tmp:
@@ -330,6 +414,7 @@ def main() -> int:
         test_wake_word,
         test_speech_cleanup,
         test_vad,
+        test_gate_multiplier,
         test_sandbox,
     ):
         try:
