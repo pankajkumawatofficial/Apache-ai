@@ -112,6 +112,11 @@ class Settings:
     # Noise-gate: threshold = max(floor, noise_floor * multiplier).
     vad_min_energy: float = _env_float("VAD_MIN_ENERGY", 0.012)
     vad_multiplier: float = _env_float("VAD_MULTIPLIER", 3.5)
+    # Context kept around the voiced span. Google's recogniser segments on
+    # silence at both ends; an utterance cut hard at the first and last voiced
+    # sample comes back as an empty string even when every word is audible.
+    vad_pre_roll_ms: int = _env_int("VAD_PRE_ROLL_MS", 150)
+    vad_keep_tail_ms: int = _env_int("VAD_KEEP_TAIL_MS", 300)
     stt_language: str = _env("STT_LANGUAGE", "en-US")
     tts_voice: str = _env("TTS_VOICE", "en-US-AndrewMultilingualNeural")
     tts_rate: str = _env("TTS_RATE", "+0%")

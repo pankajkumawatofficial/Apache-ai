@@ -148,6 +148,8 @@ class WakeListener:
             silence_end_ms=self.settings.silence_end_ms,
             min_utterance_ms=self.settings.utterance_min_ms,
             max_utterance_s=self.settings.utterance_max_s,
+            pre_roll_ms=self.settings.vad_pre_roll_ms,
+            keep_tail_ms=self.settings.vad_keep_tail_ms,
         )
 
         try:

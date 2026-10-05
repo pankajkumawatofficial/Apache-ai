@@ -211,10 +211,31 @@ def test_vad() -> None:
     if done:
         check("utterance has samples", len(done[0]) > 0)
         check("duration recorded", done[0].duration_s > 0.05)
-        # Trailing silence is trimmed, so the result is ~500 ms of voice.
-        check("trailing silence trimmed", 0.4 < done[0].duration_s < 0.65,
+        # The clip now carries context at both ends. Google's recogniser
+        # segments on silence: a window cut hard at the first and last voiced
+        # sample comes back as an EMPTY transcript even when every word is
+        # audible. Trailing silence is still trimmed, just not all of it --
+        # here that is 0.1s lead + 0.5s voice + 0.69s closing run, minus a
+        # 0.39s trim, so ~0.9s. The old all-or-nothing trim gave ~0.6s and
+        # the recogniser answered with nothing.
+        check("keeps context at both ends",
+              0.80 < done[0].duration_s < 1.05,
+              f"{done[0].duration_s:.3f}s (expect ~0.9s)")
+        check("still trims the closing run", done[0].duration_s < 1.20,
               f"{done[0].duration_s:.3f}s")
     check("gate released", not vad.listening)
+
+    # Regression: the pre-roll and the retained tail pad the clip, so the
+    # minimum-duration floor must be judged on VOICED audio alone. Otherwise a
+    # 250 ms mouth click wrapped in 150 ms of room tone reads as 700 ms and
+    # gets sent to the recogniser, which is the noise the floor exists for.
+    click_vad = EnergyVAD(sample_rate=sr, frame_ms=30,
+                          min_utterance_ms=350)
+    click_vad.feed([0.0] * (sr * 3 // 20))              # 150 ms quiet (pre-roll)
+    click_vad.feed([0.5] * (sr // 4))                   # 250 ms burst
+    rejected = click_vad.feed([0.0] * (sr * 4 // 5))    # 800 ms quiet to close
+    check("mouth click still rejected",
+          len(rejected) == 0, f"got {len(rejected)}")
 
     # Regression: the noise floor may only learn from quiet frames. If it
     # adapted during speech, a long monologue would walk its own threshold up
