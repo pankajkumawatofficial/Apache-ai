@@ -52,7 +52,10 @@ class EnergyVAD:
     multiplier:
         ``threshold = max(min_energy, noise_floor * multiplier)``.
     silence_end_ms:
-        Consecutive quiet frames required to close an utterance.
+        Consecutive quiet frames required to close an utterance. This is the
+        setting that decides whether a pause mid-question is a breath or the
+        end of the question -- too short and the query is chopped in two, the
+        first half is sent off as a complete thought, and the rest is dropped.
     min_utterance_ms:
         Shorter fragments (mouth clicks, the tail of a word) are discarded.
     max_utterance_s:
@@ -75,7 +78,7 @@ class EnergyVAD:
         frame_ms: int = 30,
         min_energy: float = 0.012,
         multiplier: float = 3.5,
-        silence_end_ms: int = 700,
+        silence_end_ms: int = 1500,
         min_utterance_ms: int = 350,
         max_utterance_s: float = 20.0,
         pre_roll_ms: int = 150,

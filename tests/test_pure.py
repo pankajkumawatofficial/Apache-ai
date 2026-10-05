@@ -204,8 +204,11 @@ def test_vad() -> None:
     check("speech alone does not close", vad.feed(loud) == [])
     check("gate marked active", vad.listening)
 
-    # Must exceed silence_end_ms (700 ms default) to close the gate.
-    trailing = [0.0] * (sr * 4 // 5)       # 800 ms of quiet
+    # Must exceed silence_end_ms (1500 ms) to close the gate. The default is
+    # deliberately long: a shorter endpoint chops a question on a thinking
+    # pause, and the fragment that survives is sent off as if it were the
+    # whole thought.
+    trailing = [0.0] * (sr * 2)             # 2000 ms of quiet
     done = vad.feed(trailing)
     check("silence closes utterance", len(done) == 1, f"got {len(done)}")
     if done:
@@ -233,7 +236,7 @@ def test_vad() -> None:
                           min_utterance_ms=350)
     click_vad.feed([0.0] * (sr * 3 // 20))              # 150 ms quiet (pre-roll)
     click_vad.feed([0.5] * (sr // 4))                   # 250 ms burst
-    rejected = click_vad.feed([0.0] * (sr * 4 // 5))    # 800 ms quiet to close
+    rejected = click_vad.feed([0.0] * (sr * 2))         # 2000 ms quiet to close
     check("mouth click still rejected",
           len(rejected) == 0, f"got {len(rejected)}")
 

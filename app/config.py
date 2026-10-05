@@ -105,8 +105,13 @@ class Settings:
     )
     sample_rate: int = 16000
     frame_ms: int = 30
-    # Silence that ends an utterance.
-    silence_end_ms: int = 700
+    # Silence that ends an utterance. This decides whether a thinking pause
+    # inside one question counts as a breath or as the end of the question --
+    # too short and the query is chopped, the fragment is sent to the agent,
+    # and whatever came after is discarded as stale. 1.5 s is past the point
+    # where a person is still gathering their next clause, and costs only the
+    # wait before transcription starts.
+    silence_end_ms: int = _env_int("SILENCE_END_MS", 1500)
     utterance_min_ms: int = 350
     utterance_max_s: float = 20.0
     # Noise-gate: threshold = max(floor, noise_floor * multiplier).

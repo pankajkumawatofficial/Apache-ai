@@ -112,6 +112,9 @@ Every setting can be overridden with an `APACHE_`-prefixed environment variable
 | `APACHE_WAKE_WORD` | `apache` | Word that activates the microphone |
 | `APACHE_TTS_VOICE` | `en-US-AndrewMultilingualNeural` | edge-tts voice |
 | `APACHE_STT_LANGUAGE` | `en-US` | Google speech recognition language |
+| `APACHE_SILENCE_END_MS` | `1500` | Quiet that ends a spoken query (see below) |
+| `APACHE_VAD_PRE_ROLL_MS` | `150` | Room tone kept before the first word |
+| `APACHE_VAD_KEEP_TAIL_MS` | `300` | Silence kept after the last word |
 | `APACHE_SANDBOX_TIMEOUT` | `20` | Seconds a `run_python` call may run |
 | `APACHE_SYSTEM_PROMPT` | *(built in)* | Overrides the system prompt |
 
@@ -206,6 +209,19 @@ and anything said while Apache answered was silently lost.
 utterances discarded because Apache was busy are all counted and shown in the
 voice panel, alongside a live input level against the current VAD gate. "It is
 not hearing me" becomes a readable diagnosis instead of a guess.
+
+**A query ends on silence, not on a breath.** The endpoint decides whether a
+pause mid-question is a breath or the end of the question. At 700 ms it fired
+mid-thought: the first clause went to the agent as though it were the whole
+question, and the remainder was dropped as stale. Worse, speech after the
+split was measured against a gate that had not settled from the previous
+utterance, so the tail often came in under the minimum-duration floor and
+vanished without any error. The default is now 1500 ms, which holds a question
+together through a 1.6 s thinking pause and still ends promptly once you have
+actually stopped. Each utterance also carries room tone at both ends
+(`APACHE_VAD_PRE_ROLL_MS`, `APACHE_VAD_KEEP_TAIL_MS`): the recogniser
+segments on silence, and a clip cut hard at the first and last voiced sample
+comes back as an empty transcript even when every word is audible.
 
 **Stoppable turns.** Every agent event is checked against a stop flag, and the
 agent yields per token, so **Stop** takes effect in roughly one token. A
