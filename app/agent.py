@@ -258,7 +258,16 @@ def _detail(exc: BaseException) -> str:
     """Flatten an exception into one readable line for the chat."""
     message = str(exc).strip() or type(exc).__name__
     text = " ".join(message.split())
+    lowered = text.lower()
+    if (
+        ("model" in lowered and "not found" in lowered)
+        or "status code: 404" in lowered
+    ):
+        return (
+            f"{text} Ollama does not have the selected model. "
+            "Run `ollama list`, then `ollama pull <model>` or choose an "
+            "installed model in the Model tab."
+        )
     if len(text) > 400:
         text = text[:400] + "..."
     return text
-

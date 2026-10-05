@@ -149,6 +149,7 @@ data/
 tests/
   test_pure.py             calculator, files, VAD, wake word, sandbox
   test_rag.py              chunking, TF-IDF, document store
+  test_stack.py            the assembled app: agent, tools, RAG, Gradio UI
 ```
 
 ### Running the tests
@@ -156,10 +157,21 @@ tests/
 ```bash
 python -m tests.test_pure
 python -m tests.test_rag
+python -m tests.test_stack
 ```
 
-Both suites exercise only standard-library code plus Apache's own pure
+The first two exercise only standard-library code plus Apache's own pure
 modules, so they pass even where the ML and audio stack cannot be installed.
+
+`tests/test_stack.py` covers the layer those two cannot reach — it builds the
+tool registry, ingests and searches a document, constructs the Gradio Blocks
+and drives a real agent turn. It **skips** (rather than fails) if the ML stack
+will not load, so it stays runnable everywhere.
+
+It exists because of a bug the other two suites were structurally blind to: a
+cleanup deleted `agent.supported_tool_names` while `ui._tools_status_text`
+still imported it. The broad `except` meant nothing crashed — the UI silently
+rendered "Tools unavailable" and both existing suites passed throughout.
 
 ---
 
@@ -189,6 +201,27 @@ otherwise.
 
 ---
 
+## Example session
+
+Verified end-to-end on this machine — `qwen3:8b` on a CPU-only laptop
+(i5-1235U, Intel UHD, 16 GB RAM):
+
+```
+You   What is 1739 * 42? Please use the calculator tool rather than
+       doing it in your head.
+
+       → calculator(expression=1739 * 42)
+       calculator: 73038
+
+Apache The result of 1739 multiplied by 42 is 73,038.
+```
+
+The activity line is emitted by the `tools` node, not by the model repeating
+itself — the arithmetic comes back from the AST evaluator in
+`app/tools/calculator.py`, which never runs `eval`.
+
+---
+
 ## Honest limitations
 
 ### The code sandbox is *not* a security sandbox
@@ -213,6 +246,28 @@ Ollama, your documents and your files stay on your machine. Three things go
 out: Google speech recognition (microphone audio), Edge TTS (the text of your
 reply), and DuckDuckGo when `web_search` is called. Turn spoken replies off in
 the **Voice** tab if you would rather not send reply text for synthesis.
+
+### It is only as fast as your hardware
+
+Apache does no inference of its own — Ollama does, and Ollama reports
+`PROCESSOR: 100% CPU` on a machine without a supported GPU. On the machine this
+was developed on, a single tool-calling turn against `qwen3:8b` takes **~3
+minutes**; a plain reply is faster but still tens of seconds, and the first turn
+after a pull pays for loading 6.7 GB into memory.
+
+That is the model, not the app: token streaming, the activity panel and the
+voice path all work normally, you just wait longer for tokens.
+
+If that is too slow, the lever is the model, not the configuration:
+
+| Model | Size | On this hardware |
+|---|---|---|
+| `qwen3:8b` | 5.2 GB | default; ~3 min / tool turn |
+| `qwen3:4b` | 2.6 GB | noticeably quicker, still reliable at tool calls |
+| `qwen3:1.7b` | 1.4 GB | fast, but will occasionally skip tools |
+
+Set `APACHE_MODEL` or pick a different model in the **Model** tab — no restart
+required. A machine with an NVIDIA GPU lands in a different category entirely.
 
 ### Windows Smart App Control
 
