@@ -34,7 +34,7 @@ from ..config import Settings, settings as default_settings
 from .vad import EnergyVAD
 from .wake import match_wake
 
-__all__ = ["WakeListener", "WAKE_ONLY_PROMPT"]
+__all__ = ["WakeListener", "WAKE_ONLY_PROMPT", "list_input_devices"]
 
 #: What the assistant is told when the wake word arrives with no instruction.
 WAKE_ONLY_PROMPT = (
@@ -51,6 +51,41 @@ _MAX_PENDING_BLOCKS = 64
 #: speech captured *during* an answer is stale by the time we could act on it,
 #: so we would rather discard it and say so than replay it minutes later.
 _MAX_UTTERANCES = 4
+
+
+def list_input_devices() -> list[tuple[int, str]]:
+    """Every input device the listener could open, default one first.
+
+    Windows will move the default input to a jack with nothing plugged into
+    it, and a listener started on such a device receives perfect silence while
+    reporting that it is listening. Letting the device be chosen explicitly is
+    the only way to tell "wrong microphone" apart from "broken microphone".
+    """
+    try:
+        import sounddevice as sd
+    except Exception:  # noqa: BLE001 - audio unavailable, nothing to list
+        return []
+    try:
+        default = sd.default.device[0]
+    except Exception:  # noqa: BLE001 - no default configured
+        default = None
+    try:
+        devices = sd.query_devices()
+    except Exception:  # noqa: BLE001 - no host API at all
+        return []
+
+    found: list[tuple[int, str]] = []
+    for index, info in enumerate(devices):
+        if int(info.get("max_input_channels", 0) or 0) <= 0:
+            continue
+        name = str(info.get("name", f"device {index}"))
+        rate = int(round(float(info.get("default_samplerate", 0) or 0)))
+        label = f"[{index}] {name}" + (f" @ {rate} Hz" if rate else "")
+        found.append((index, label))
+
+    if default is not None:
+        found.sort(key=lambda item: item[0] != default)
+    return found
 
 
 class WakeListener:
@@ -84,6 +119,7 @@ class WakeListener:
         self._transcript = ""
         self._rate = 0
         self._device_name = ""
+        self._device_index = -1
         self._stt_failures = 0
 
         # Diagnostics. Silent loss is the hardest kind of failure to debug, so
@@ -109,6 +145,7 @@ class WakeListener:
                 "transcript": self._transcript,
                 "sample_rate": self._rate,
                 "device": self._device_name,
+                "device_index": self._device_index,
                 "muted": time.time() < self._muted_until,
                 "wake_word": self.settings.wake_word,
                 # Capture health.
@@ -118,11 +155,18 @@ class WakeListener:
                 "xruns": self._xruns,
                 "ignored": self._ignored_utterances,
                 "capture_errors": self._capture_errors,
+                "rejected": (self._vad.rejected_count
+                             if self._vad is not None else 0),
                 "queued": len(self._utterances),
             }
 
-    def start(self) -> str:
-        """Open the microphone and start both workers. Returns a status line."""
+    def start(self, device_index: int | None = None) -> str:
+        """Open the microphone and start both workers. Returns a status line.
+
+        *device_index* picks a specific input device. ``None`` takes whatever
+        Windows currently considers the default, which it may have moved since
+        the page was opened.
+        """
         with self._lock:
             if self._running:
                 return self._message
@@ -133,8 +177,14 @@ class WakeListener:
             return self._fail(f"Audio input unavailable: {exc}")
 
         try:
-            device_index = sd.default.device[0]
+            if device_index is None:
+                device_index = sd.default.device[0]
+            device_index = int(device_index)
             info = sd.query_devices(device_index, "input")
+            if int(info.get("max_input_channels", 0) or 0) <= 0:
+                return self._fail(
+                    f"{info.get('name', 'That device')} accepts no input."
+                )
             rate = int(round(float(info.get("default_samplerate", 16000)) or 16000))
             device_name = str(info.get("name", "default input"))
         except Exception as exc:  # noqa: BLE001 - no microphone at all
@@ -169,6 +219,7 @@ class WakeListener:
             self._vad = vad
             self._rate = rate
             self._device_name = device_name
+            self._device_index = device_index
             self._pending.clear()
             self._utterances.clear()
             self._dropped_blocks = 0

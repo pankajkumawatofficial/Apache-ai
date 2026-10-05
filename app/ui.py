@@ -21,7 +21,7 @@ import gradio as gr
 from .config import DEFAULT_WAKE_ALIASES, settings
 from .core import Assistant, Snapshot, get_assistant
 from .llm import check_ollama
-from .voice.listener import WakeListener
+from .voice.listener import WakeListener, list_input_devices
 
 __all__ = ["build_demo", "build_and_launch"]
 
@@ -97,6 +97,11 @@ def _voice_status_text(listener: WakeListener) -> str:
     notes = []
     if info.get("capture_errors"):
         notes.append(f"⚠ {info['capture_errors']} audio block error(s)")
+    if info.get("rejected"):
+        notes.append(
+            f"⚠ {info['rejected']} utterance(s) heard but discarded as too "
+            "short — the gate is clipping your voice"
+        )
     if info.get("xruns"):
         notes.append(f"⚠ {info['xruns']} audio overrun(s)")
     if info.get("dropped_blocks"):
@@ -162,6 +167,27 @@ def _settings_status_text(assistant: Assistant, ollama: Any = None) -> str:
 def _render(snapshot: Snapshot) -> tuple[Any, Any, Any, Any]:
     messages, activity, audio, status = snapshot
     return messages, activity, audio, status
+
+
+def _device_choices() -> tuple[list[str], str]:
+    """Microphone picker entries, with the system default listed and selected.
+
+    The default is only a starting point -- Windows may move it while the page
+    is open, so the choice is read at click time rather than trusted.
+    """
+    devices = list_input_devices()
+    if not devices:
+        return ["(no microphone found)"], ""
+    labels = [label for _index, label in devices]
+    return labels, labels[0]
+
+
+def _device_index(label: str | None) -> int | None:
+    """Recover the PortAudio index from the label the picker submitted."""
+    if not label:
+        return None
+    head = str(label).split("]", 1)[0].lstrip("[")
+    return int(head) if head.isdigit() else None
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +266,14 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
 
             # ---------------- side column ----------------
             with gr.Column(scale=1, min_width=320):
+                _dev_labels, _dev_default = _device_choices()
+                mic_device = gr.Dropdown(
+                    choices=_dev_labels,
+                    value=_dev_default,
+                    label="Microphone",
+                    info="Windows may move the default while the page is open; "
+                         "pick the one you actually speak into.",
+                )
                 mic_button = gr.Button("Start listening", variant="primary")
                 voice_status = gr.Markdown(_voice_status_text(listener))
 
@@ -347,11 +381,14 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
             messages, _act, _audio, stat = assistant.snapshot()
             return messages, gr.skip(), stat
 
-        def on_mic() -> tuple:
+        def on_mic(device_value: str | None) -> tuple:
             if listener.running:
                 listener.stop()
             else:
-                listener.start()
+                # Read the picker at click time: the system default may have
+                # moved since the page loaded, and starting on a silent device
+                # looks exactly like a broken one.
+                listener.start(device_index=_device_index(device_value))
             label = "Stop listening" if listener.running else "Start listening"
             variant = "stop" if listener.running else "primary"
             return _voice_status_text(listener), gr.update(value=label, variant=variant)
@@ -437,7 +474,8 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
             ],
         )
 
-        mic_button.click(on_mic, outputs=[voice_status, mic_button])
+        mic_button.click(on_mic, inputs=[mic_device],
+                         outputs=[voice_status, mic_button])
         stop.click(on_stop, outputs=[chatbot, voice_audio, status])
         files.upload(on_ingest, inputs=files,
                      outputs=[chatbot, activity, voice_audio, status, docs_status])

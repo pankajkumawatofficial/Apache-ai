@@ -239,6 +239,12 @@ def test_vad() -> None:
     rejected = click_vad.feed([0.0] * (sr * 2))         # 2000 ms quiet to close
     check("mouth click still rejected",
           len(rejected) == 0, f"got {len(rejected)}")
+    # Being rejected must be observable: a real word that the gate clipped
+    # lands in the same place as a mouth click, and without a count the two
+    # are indistinguishable to the user.
+    check("discarded utterances are counted",
+          click_vad.rejected_count >= 1,
+          f"count={click_vad.rejected_count}")
 
     # Regression: the noise floor may only learn from quiet frames. If it
     # adapted during speech, a long monologue would walk its own threshold up

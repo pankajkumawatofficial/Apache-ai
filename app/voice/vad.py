@@ -108,6 +108,8 @@ class EnergyVAD:
         self._silent_frames = 0
         self._speech_frames = 0
         self._voiced_samples = 0
+        #: Utterances the duration floor discarded this session.
+        self.rejected_count = 0
 
     # -- introspection ---------------------------------------------------
     @property
@@ -223,6 +225,10 @@ class EnergyVAD:
         # Counted on voiced audio alone, so the room tone deliberately kept at
         # each end cannot pad a mouth click past the floor.
         if voiced < self.min_utterance_samples:
+            # A word the gate only partly cleared lands here: speech was heard
+            # and then thrown away. Without counting it, that is
+            # indistinguishable from never having heard anything at all.
+            self.rejected_count += 1
             return None
         return Utterance(samples, self.sample_rate)
 
