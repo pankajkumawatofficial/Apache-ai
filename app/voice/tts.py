@@ -1,10 +1,13 @@
 """Text-to-speech for Apache's spoken replies.
 
-Microsoft Edge neural voices via :mod:`edge_tts`.  They need the network, but
-they sound dramatically better than the built-in SAPI5 voices, which is the
-whole point of a spoken assistant.
+Offline by default: replies are synthesised by :mod:`piper` from a local ONNX
+voice, which takes milliseconds once the model is loaded and touches no
+network at all. ``APACHE_OFFLINE=0`` switches to Microsoft Edge neural voices
+via :mod:`edge_tts`, which sound better but cost a network round trip for
+every single reply -- the reason a spoken answer was slow to arrive, and on a
+bad connection, never arrived.
 
-``clear_for_speech`` lives here because the reply path -- not the voice path --
+``speakable_text`` lives here because the reply path -- not the voice path --
 is where a Markdown table would otherwise get read out as pipes.
 """
 
@@ -12,13 +15,31 @@ from __future__ import annotations
 
 import asyncio
 import re
+import tempfile
+import threading
+import wave
 from pathlib import Path
 
+from ..config import settings
 from .wake import clean_for_speech
 
-__all__ = ["synthesize", "speakable_text", "estimate_duration_s", "TTSUnavailable"]
+__all__ = [
+    "TTSUnavailable",
+    "clip_extension",
+    "estimate_duration_s",
+    "speakable_text",
+    "synthesize",
+    "warm_up",
+]
 
 DEFAULT_VOICE = "en-US-AndrewMultilingualNeural"
+
+#: Loaded on first use and kept: Piper takes seconds to load and milliseconds
+#: to speak, so reloading it per reply would undo the whole point.
+_PIPER_VOICE = None
+#: The greeting, an idle check-in and a first reply can all reach the voice
+#: at once, so loading is serialised rather than raced.
+_PIPER_LOCK = threading.Lock()
 
 
 class TTSUnavailable(RuntimeError):
@@ -59,11 +80,121 @@ def estimate_duration_s(text: str) -> float:
     return round(words / 150.0 * 60.0, 2)
 
 
+def clip_extension() -> str:
+    """Suffix matching the current engine: ``.wav`` offline, ``.mp3`` online.
+
+    The reply path asks for this so a clip is named for what is inside it --
+    a Piper WAV wearing an .mp3 extension fails to decode in the browser,
+    which looks exactly like Apache choosing not to speak.
+    """
+    return ".wav" if settings.offline else ".mp3"
+
+
 async def _save(text: str, voice: str, rate: str, path: Path) -> None:
     import edge_tts  # imported lazily so text-only runs never touch the network stack
 
     communicate = edge_tts.Communicate(text, voice=voice, rate=rate)
     await communicate.save(str(path))
+
+
+def _piper_voice():
+    """Load the local voice once and keep it in memory.
+
+    Double-checked under a lock: the greeting, an idle check-in and a first
+    reply can all arrive together, and two threads loading 60 MB at once is
+    how the first spoken line ends up several seconds late.
+    """
+    global _PIPER_VOICE
+    if _PIPER_VOICE is not None:
+        return _PIPER_VOICE
+
+    with _PIPER_LOCK:
+        if _PIPER_VOICE is not None:
+            return _PIPER_VOICE
+
+        from piper import PiperVoice  # optional dependency, imported on use
+
+        model = Path(settings.piper_voice)
+        if not model.exists():
+            raise TTSUnavailable(
+                f"no offline voice at {model}. Fetch it once following the README, "
+                "or set APACHE_OFFLINE=0 to go back to edge-tts."
+            )
+        try:
+            _PIPER_VOICE = PiperVoice.load(str(model))
+        except Exception as exc:  # noqa: BLE001 - a bad download must not wedge
+            raise TTSUnavailable(f"could not load {model.name}: {exc}") from exc
+    return _PIPER_VOICE
+
+
+def warm_up() -> bool:
+    """Load the offline voice and run one tiny synthesis.
+
+    Loading plus the first inference costs several seconds, because
+    onnxruntime plans the graph on that call and never again. Paying it
+    before the greeting turns the greeting into a sub-second clip instead of
+    five seconds of silence after the page opens. Best effort: warming up is
+    never allowed to fail the launch.
+    """
+    if not settings.offline:
+        return False
+    try:
+        _piper_voice()
+    except TTSUnavailable:
+        return False
+    try:
+        target = Path(tempfile.gettempdir()) / "apache-tts-warmup.wav"
+        _piper_speech("hi", target, "+0%")
+        target.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 - best effort by design
+        return False
+    return True
+
+
+def _length_scale(rate: str) -> float:
+    """Turn an edge-style ``+20%`` into Piper's length scale.
+
+    Piper's scale measures duration rather than speed, so saying the same
+    words in 120% of the time is a scale of 1/1.2 -- faster means smaller.
+    """
+    match = re.match(r"^\s*([+-]?\d+(?:\.\d+)?)\s*%", str(rate))
+    if not match:
+        return 1.0
+    try:
+        speed = 1.0 + float(match.group(1)) / 100.0
+    except ValueError:
+        return 1.0
+    if speed <= 0.05:
+        return 1.0
+    return 1.0 / speed
+
+
+def _piper_speech(spoken: str, path: Path, rate: str) -> None:
+    """Synthesise locally. No network, and the model stays loaded."""
+    voice = _piper_voice()
+    scale = _length_scale(rate)
+    config = None
+    if abs(scale - 1.0) > 1e-6:
+        from piper import SynthesisConfig
+
+        config = SynthesisConfig(length_scale=scale)
+    try:
+        with wave.open(str(path), "wb") as handle:
+            if config is None:
+                voice.synthesize_wav(spoken, handle)
+            else:
+                voice.synthesize_wav(spoken, handle, syn_config=config)
+    except Exception as exc:  # noqa: BLE001 - audio must never break a turn
+        raise TTSUnavailable(f"offline synthesis failed: {exc}") from exc
+
+
+def _edge_speech(spoken: str, path: Path, voice: str, rate: str) -> None:
+    try:
+        # edge_tts owns the event loop; run it in isolation so we never
+        # collide with whatever loop the caller (Gradio) is already using.
+        asyncio.run(_save(spoken, voice, rate, path))
+    except Exception as exc:  # network, DNS, revoked endpoint, bad voice name
+        raise TTSUnavailable(str(exc)) from exc
 
 
 def synthesize(
@@ -73,7 +204,7 @@ def synthesize(
     voice: str = DEFAULT_VOICE,
     rate: str = "+0%",
 ) -> Path:
-    """Write *text* to *out_path* as an MP3 and return the path.
+    """Write *text* to *out_path* and return the path.
 
     Raises :class:`TTSUnavailable` on failure so the caller can fall back to
     a silent reply rather than crashing the turn.
@@ -85,12 +216,10 @@ def synthesize(
     path = Path(out_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
-        # edge_tts owns the event loop; run it in isolation so we never
-        # collide with whatever loop the caller (Gradio) is already using.
-        asyncio.run(_save(spoken, voice, rate, path))
-    except Exception as exc:  # network, DNS, revoked endpoint, bad voice name
-        raise TTSUnavailable(str(exc)) from exc
+    if settings.offline:
+        _piper_speech(spoken, path, rate)
+    else:
+        _edge_speech(spoken, path, voice, rate)
 
     if not path.exists() or path.stat().st_size == 0:
         raise TTSUnavailable("synthesis produced no audio")

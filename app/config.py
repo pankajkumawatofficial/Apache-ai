@@ -18,6 +18,7 @@ DATA = ROOT / "data"
 UPLOADS = DATA / "uploads"      # documents you upload for RAG
 WORKSPACE = DATA / "workspace"  # the only directory file tools may touch
 AUDIO = DATA / "audio"          # generated TTS clips
+MODELS = ROOT / "models"        # speech models, downloaded once, never tracked
 
 for _p in (DATA, UPLOADS, WORKSPACE, AUDIO):
     _p.mkdir(parents=True, exist_ok=True)
@@ -145,6 +146,24 @@ class Settings:
     tts_rate: str = _env("TTS_RATE", "+0%")
     # Mute the mic while we are talking so the assistant does not hear itself.
     playback_mute_s: float = _env_float("PLAYBACK_MUTE_S", 2.0)
+    # Open the microphone as soon as the app starts, so "Apache" works
+    # without a first click on the mic button. 0 starts it stopped.
+    mic_autostart: bool = _env_bool("MIC_AUTOSTART", True)
+
+    # --- offline speech ---------------------------------------------------
+    # Offline is the default. Every utterance over Google's endpoint and every
+    # reply through edge-tts costs a network round trip, and recognition is
+    # throttled after a burst -- the two things that made voice feel slow and
+    # intermittently silent. APACHE_OFFLINE=0 goes back to the online engines.
+    offline: bool = _env_bool("OFFLINE", True)
+    # Whisper size. "base.en" is ~75 MB and several times real time on this
+    # CPU; "small.en" is more accurate and roughly twice as slow.
+    whisper_model: str = _env("WHISPER_MODEL", "base.en")
+    whisper_dir: Path = Path(_env("WHISPER_DIR", str(MODELS / "whisper")))
+    # A Piper .onnx file with its .onnx.json sitting beside it.
+    piper_voice: str = _env(
+        "PIPER_VOICE", str(MODELS / "piper" / "en_US-ryan-medium.onnx")
+    )
 
     # --- presence ---------------------------------------------------------
     # Spoken once when Apache comes up, before anyone has asked anything.

@@ -1,22 +1,39 @@
-"""Speech to text via Google's free web endpoint, through SpeechRecognition.
+"""Speech to text.
 
-Utterances arrive from the VAD as float samples; they are converted to 16-bit
-PCM and handed to :class:`speech_recognition.AudioData`, which encodes FLAC
-using the encoder it bundles for the current platform.
+Offline by default: utterances go to :mod:`faster_whisper`, which runs a local
+model and never touches the network. That removes a round trip from every
+query, removes the throttling Google applies to a burst of recognitions, and
+keeps working with the cable unplugged. ``APACHE_OFFLINE=0`` uses Google's
+free web endpoint through :mod:`speech_recognition` instead, which is more
+accurate on noisy input but needs the network.
+
+Utterances arrive from the VAD as float samples. The local path passes them to
+Whisper as a NumPy array rather than a file: ``transcribe()`` skips its
+``decode_audio`` step for an array, which is both faster and the only way to
+avoid a PyAV incompatibility (``av.open`` no longer accepts the
+``metadata_errors`` argument faster-whisper passes, and would raise
+``TypeError`` on every call).
 """
 
 from __future__ import annotations
 
 import sys
+import threading
 from typing import Any
 
-__all__ = ["STTUnavailable", "to_pcm16", "transcribe"]
+from ..config import settings
 
-_MIN_PCM_BYTES = 2 * 800          # <0.25 s of mono 16-bit at 16 kHz
+__all__ = ["STTUnavailable", "to_pcm16", "transcribe", "warm_up"]
+
+#: 800 samples -- the same floor the online path has always used.
+_MIN_SAMPLES = 800
+
+#: Whisper's own input rate. Anything else is resampled on the way in.
+_WHISPER_RATE = 16_000
 
 
 class STTUnavailable(RuntimeError):
-    """Raised when the recogniser could not be reached (usually no network)."""
+    """Raised when the recogniser failed (usually no network, or no model)."""
 
 
 def to_pcm16(samples: Any) -> bytes:
@@ -44,6 +61,92 @@ def to_pcm16(samples: Any) -> bytes:
     return (array * 32767.0).astype("<i2").tobytes()
 
 
+# --------------------------------------------------------------------------
+# Offline: faster-whisper
+# --------------------------------------------------------------------------
+_MODEL: Any = None
+_MODEL_LOCK = threading.Lock()
+
+
+def _whisper_model():
+    """Load the local model once and keep it; loading per query costs seconds."""
+    global _MODEL
+    if _MODEL is not None:
+        return _MODEL
+
+    with _MODEL_LOCK:
+        if _MODEL is not None:
+            return _MODEL
+        try:
+            from faster_whisper import WhisperModel
+        except Exception as exc:  # noqa: BLE001 - blocked or missing wheel
+            raise STTUnavailable(f"offline recognition unavailable: {exc}") from exc
+        try:
+            _MODEL = WhisperModel(
+                settings.whisper_model,
+                device="cpu",
+                compute_type="int8",
+                download_root=str(settings.whisper_dir),
+            )
+        except Exception as exc:  # noqa: BLE001 - missing or partial model
+            raise STTUnavailable(
+                f"could not load {settings.whisper_model}: {exc}"
+            ) from exc
+    return _MODEL
+
+
+def _whisper_audio(samples: Any, sample_rate: int):
+    """Float32 mono at 16 kHz -- what Whisper's feature extractor expects.
+
+    The capture rate is whatever the microphone's default is (often 44.1 or
+    48 kHz), so this resamples on the way in. Linear interpolation is enough
+    here: Whisper is trained on speech that has already been band-limited, and
+    the alternative is pulling in SciPy for one step.
+    """
+    import numpy as np
+
+    array = np.asarray(samples, dtype=np.float32).reshape(-1)
+    np.clip(array, -1.0, 1.0, out=array)
+    if sample_rate == _WHISPER_RATE or array.size < 2:
+        return array
+
+    duration = array.size / float(sample_rate)
+    target = max(1, int(round(duration * _WHISPER_RATE)))
+    source = np.linspace(0.0, duration, num=array.size, endpoint=False)
+    at = np.arange(target, dtype=np.float64) / float(_WHISPER_RATE)
+    return np.interp(at, source, array).astype(np.float32)
+
+
+def _whisper_language(language: str) -> str:
+    """Whisper wants ``en``, not ``en-US``."""
+    return (language or "en").split("-", 1)[0].split("_", 1)[0].lower() or "en"
+
+
+def _transcribe_local(samples: Any, sample_rate: int, language: str) -> str:
+    model = _whisper_model()
+    audio = _whisper_audio(samples, sample_rate)
+    try:
+        # An ndarray is passed straight through: no decode, no PyAV.
+        segments, _info = model.transcribe(
+            audio,
+            language=_whisper_language(language),
+            beam_size=1,
+            vad_filter=False,
+            # A local model with no history is more predictable, and this is
+            # one utterance at a time rather than a transcript.
+            condition_on_previous_text=False,
+        )
+        text = " ".join(segment.text for segment in segments).strip()
+    except Exception as exc:  # noqa: BLE001 - engine internals, never fatal
+        raise STTUnavailable(
+            f"offline recognition failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    return text
+
+
+# --------------------------------------------------------------------------
+# Online: Google's free web endpoint
+# --------------------------------------------------------------------------
 def _recognizer():
     import speech_recognition as sr
 
@@ -59,18 +162,10 @@ def _recognizer():
 _RECOGNIZER: Any = None
 
 
-def transcribe(samples: Any, sample_rate: int, language: str = "en-US") -> str:
-    """Recognise one utterance.
-
-    Returns ``""`` when nothing was audible, and raises
-    :class:`STTUnavailable` when the network endpoint cannot be reached --
-    the caller decides whether that is fatal.
-    """
+def _transcribe_google(samples: Any, sample_rate: int, language: str) -> str:
     pcm = to_pcm16(samples)
-    if len(pcm) < _MIN_PCM_BYTES:
+    if len(pcm) < 2 * _MIN_SAMPLES:
         return ""
-    if sample_rate <= 0:
-        raise STTUnavailable("invalid sample rate")
 
     try:
         import speech_recognition as sr
@@ -92,3 +187,36 @@ def transcribe(samples: Any, sample_rate: int, language: str = "en-US") -> str:
         ) from exc
 
     return str(result or "").strip()
+
+
+# --------------------------------------------------------------------------
+def warm_up() -> bool:
+    """Load the local model so the first query does not pay for it.
+
+    Returns False when there is nothing to warm up (online mode, or the model
+    is missing) -- warming up is best effort and never fails a launch.
+    """
+    if not settings.offline:
+        return False
+    try:
+        _whisper_model()
+    except STTUnavailable:
+        return False
+    return True
+
+
+def transcribe(samples: Any, sample_rate: int, language: str = "en-US") -> str:
+    """Recognise one utterance.
+
+    Returns ``""`` when nothing was audible, and raises
+    :class:`STTUnavailable` when the engine failed -- the caller decides
+    whether that is fatal.
+    """
+    if sample_rate <= 0:
+        raise STTUnavailable("invalid sample rate")
+    if samples is None or len(samples) < _MIN_SAMPLES:
+        return ""
+
+    if settings.offline:
+        return _transcribe_local(samples, sample_rate, language)
+    return _transcribe_google(samples, sample_rate, language)

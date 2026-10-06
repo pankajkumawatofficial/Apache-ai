@@ -18,6 +18,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.config import settings                                        # noqa: E402
 from app.text import plain_math                                        # noqa: E402
 from app.tools.calculator import CalcError, safe_eval          # noqa: E402
+from app.tools.control import (                               # noqa: E402
+    ControlError,
+    open_file,
+    open_url,
+    resolve_target,
+)
 from app.tools.files import (                                  # noqa: E402
     FileAccessError,
     list_files,
@@ -229,7 +235,144 @@ def test_plain_math() -> None:
           "`\\t`" in got and "$" not in got, repr(got))
 
 
+def test_computer_control() -> None:
+    print("computer control")
+    import shutil
+
+    from app.tools import control
+
+    # Nothing here may open a real window on the developer's desktop: the
+    # launcher is the single seam control.py exposes, so replacing it is enough.
+    launched: list[object] = []
+    original = control._launch
+    control._launch = launched.append
+    workspace = Path(tempfile.mkdtemp()).resolve()
+
+    try:
+        control.open_url("youtube.com")
+        check("adds the missing scheme",
+              launched[-1] == "https://youtube.com", repr(launched[-1]))
+
+        control.open_url("https://example.com/a?b=1")
+        check("keeps a full address",
+              launched[-1] == "https://example.com/a?b=1", repr(launched[-1]))
+
+        # Defaulting the scheme must not launder a dangerous one.
+        for bad in ("file:///C:/Windows/System32", "javascript:alert(1)",
+                    "ms-settings:privacy"):
+            scheme = bad.split(":", 1)[0]
+            try:
+                control.open_url(bad)
+                outcome = "NOT REFUSED"
+            except ControlError as exc:
+                outcome = str(exc)
+            check(f"refuses the {scheme} scheme", "only http" in outcome, outcome)
+
+        try:
+            control.open_url("   ")
+            outcome = "NOT REFUSED"
+        except ControlError as exc:
+            outcome = str(exc)
+        check("an empty URL is refused", "no URL" in outcome, outcome)
+
+        relative = resolve_target("notes/todo.txt", workspace)
+        check("a relative path resolves inside the workspace",
+              relative == (workspace / "notes" / "todo.txt").resolve(),
+              repr(relative))
+        absolute = resolve_target(str(workspace / "a.txt"), workspace)
+        check("an absolute path is kept as given", absolute == workspace / "a.txt",
+              repr(absolute))
+
+        try:
+            open_file("absent.txt", workspace)
+            outcome = "NOT REFUSED"
+        except ControlError as exc:
+            outcome = str(exc)
+        check("reports a missing file", "no such file" in outcome, outcome)
+
+        (workspace / "installer.exe").write_bytes(b"MZ")
+        try:
+            open_file("installer.exe", workspace)
+            outcome = "NOT REFUSED"
+        except ControlError as exc:
+            outcome = str(exc)
+        check("refuses to run an executable",
+              "refusing to run" in outcome, outcome)
+        check("a refused executable was never launched",
+              all("installer.exe" not in str(x) for x in launched), repr(launched))
+
+        (workspace / "docs").mkdir()
+        open_file("docs", workspace)
+        check("a folder opens through the same seam",
+              str(workspace / "docs") in [str(x) for x in launched],
+              repr(launched[-3:]))
+    finally:
+        control._launch = original
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------
+def test_speech_engines() -> None:
+    print("offline speech engines")
+    from app.voice import stt, tts
+
+    # The file name has to match what is inside: a Piper clip wearing an .mp3
+    # extension fails to decode in the browser, which looks exactly like
+    # Apache choosing not to speak.
+    check("offline clips are named .wav", tts.clip_extension() == ".wav",
+          tts.clip_extension())
+
+    check("default rate leaves speed alone",
+          abs(tts._length_scale("+0%") - 1.0) < 1e-9,
+          repr(tts._length_scale("+0%")))
+    check("faster means a shorter scale", tts._length_scale("+20%") < 1.0,
+          repr(tts._length_scale("+20%")))
+    check("slower means a longer scale", tts._length_scale("-20%") > 1.0,
+          repr(tts._length_scale("-20%")))
+    check("an unreadable rate is ignored", tts._length_scale("banana") == 1.0,
+          repr(tts._length_scale("banana")))
+
+    check("Whisper gets the primary subtag",
+          stt._whisper_language("en-US") == "en",
+          repr(stt._whisper_language("en-US")))
+    check("…including underscore locales", stt._whisper_language("pt_BR") == "pt",
+          repr(stt._whisper_language("pt_BR")))
+    check("…and defaults to English", stt._whisper_language("") == "en",
+          repr(stt._whisper_language("")))
+
+    check("a silent utterance is dropped",
+          stt.transcribe([0.0] * 10, 16_000) == "", "not dropped")
+    try:
+        stt.transcribe([0.0] * 5_000, 0)
+        outcome = "NO ERROR"
+    except stt.STTUnavailable as exc:
+        outcome = str(exc)
+    check("an impossible sample rate is refused",
+          "invalid sample" in outcome, outcome)
+
+    # The microphone runs at its device default (44.1 kHz here), so the local
+    # engine has to resample on the way in.
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+    if np is not None:
+        quarter_second = np.zeros(44_100 // 4, dtype=np.float32)
+        resized = stt._whisper_audio(quarter_second, 44_100)
+        check("resamples to Whisper's 16 kHz",
+              resized.dtype == np.float32 and abs(resized.size - 4_000) <= 2,
+              f"dtype={resized.dtype} size={resized.size}")
+        check("leaves an already-correct rate alone",
+              stt._whisper_audio(np.zeros(1_600, np.float32), 16_000).size
+              == 1_600, "was resampled anyway")
+        check("clipping is bounded",
+              float(np.abs(stt._whisper_audio(
+                  np.array([5.0, -5.0], np.float32), 16_000)).max()) <= 1.0,
+              "unclipped")
+    else:
+        print("  skip resampling checks (numpy not importable)")
+
+
 def test_vad() -> None:
     print("vad")
     sr = 16_000
@@ -451,6 +594,8 @@ def main() -> int:
         test_wake_word,
         test_speech_cleanup,
         test_plain_math,
+        test_computer_control,
+        test_speech_engines,
         test_vad,
         test_gate_multiplier,
         test_sandbox,

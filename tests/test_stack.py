@@ -54,6 +54,8 @@ EXPECTED_TOOLS = {
     "write_file_tool",
     "search_documents",
     "current_datetime",
+    "open_url_tool",
+    "open_file_tool",
     "web_search",
 }
 
@@ -100,7 +102,7 @@ def test_tool_registry() -> None:
 
     names = {getattr(tool, "name", "") for tool in tools}
     missing = EXPECTED_TOOLS - names
-    check("all eight contract tools registered", not missing,
+    check("every contract tool registered", not missing,
           f"missing={sorted(missing)} extra={sorted(names - EXPECTED_TOOLS)}")
 
     # A tool without a description will not be called by the model.
@@ -394,6 +396,142 @@ def test_capture_feeds_vad() -> None:
           f"level={listener.status()['level']}")
 
 
+def test_audio_queue() -> None:
+    """Clips queue instead of overwriting each other.
+
+    This is the guard for "Apache is not speaking all responses": replies and
+    announcements share one slot, and whichever finished synthesising last
+    won it. Three clips completing inside a single 0.6 s tick used to leave
+    two of them never played.
+    """
+    get_assistant, _, _, _ = _load_stack()
+    assistant = get_assistant()
+
+    saved_queue = list(assistant._audio_queue)
+    saved_free = assistant._audio_free_at
+    saved_audio = assistant._audio
+
+    def release() -> None:
+        """Pretend whatever was playing has finished."""
+        with assistant._lock:
+            assistant._audio_free_at = time.monotonic() - 0.01
+
+    try:
+        with assistant._lock:
+            assistant._audio_queue = [("a.mp3", 3.0), ("b.mp3", 3.0),
+                                      ("c.mp3", 3.0)]
+            assistant._audio_free_at = 0.0
+            assistant._audio = None
+
+        first = assistant.next_audio()
+        check("hands out the first clip", first == "a.mp3", repr(first))
+        check("one clip leaves the queue", assistant.pending_audio() == 2,
+              str(assistant.pending_audio()))
+        check("holds the rest while the first plays", assistant.next_audio()
+              is None, "released early")
+        check("and has not lost them", assistant.pending_audio() == 2,
+              str(assistant.pending_audio()))
+
+        release()
+        check("releases the next once the first could have ended",
+              assistant.next_audio() == "b.mp3", "wrong clip")
+        release()
+        check("then the last", assistant.next_audio() == "c.mp3", "wrong clip")
+        check("nothing left to give", assistant.next_audio() is None,
+              "expected None")
+        check("queue ended empty", assistant.pending_audio() == 0,
+              str(assistant.pending_audio()))
+
+        # The path from a finished reply to the queue, without the network.
+        import app.voice.tts as tts_mod
+
+        def fake_synthesize(text, out_path, **kwargs):
+            path = Path(out_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"ID3fake")
+            return path
+
+        real = tts_mod.synthesize
+        tts_mod.synthesize = fake_synthesize
+        try:
+            with assistant._lock:
+                assistant._audio_queue = []
+                assistant._audio_free_at = 0.0
+                assistant._audio = None
+            assistant._synthesize("first reply")
+            assistant._synthesize("second reply")
+            check("two finished replies both queue",
+                  assistant.pending_audio() == 2, str(assistant.pending_audio()))
+            check("neither is assigned before it plays",
+                  assistant.snapshot()[2] in (None, ""), repr(assistant.snapshot()[2]))
+        finally:
+            tts_mod.synthesize = real
+    finally:
+        with assistant._lock:
+            assistant._audio_queue = saved_queue
+            assistant._audio_free_at = saved_free
+            assistant._audio = saved_audio
+
+
+def test_offline_speech() -> None:
+    """A reply must come out of the local engine as a playable file.
+
+    This is the other half of "Apache is not speaking all responses": the
+    engine has to write something the browser can decode, under the name that
+    says what it actually is.
+    """
+    get_assistant, _, _, _ = _load_stack()
+    get_assistant()
+
+    import wave
+
+    from app.voice import tts
+
+    if not tts.settings.offline:
+        print("  skip: APACHE_OFFLINE=0 selects the online engine")
+        return
+    if not Path(tts.settings.piper_voice).exists():
+        # A per-machine download: report it, do not fail the suite on it.
+        print(f"  skip: no Piper voice at {tts.settings.piper_voice}")
+        return
+
+    out = Path(tempfile.gettempdir()) / "apache-test-speech.wav"
+    out.unlink(missing_ok=True)
+    try:
+        path = tts.synthesize("Testing one two three.", out)
+        check("produced a file",
+              path.exists() and path.stat().st_size > 0,
+              f"{path} ({path.stat().st_size if path.exists() else 0} B)")
+        check("named for the format it really is", path.suffix == ".wav",
+              path.suffix)
+        with wave.open(str(path), "rb") as handle:
+            seconds = handle.getnframes() / handle.getframerate()
+            rate = handle.getframerate()
+        check("holds audible-length audio", 0.2 < seconds < 30.0,
+              f"{seconds:.2f}s at {rate} Hz")
+    finally:
+        out.unlink(missing_ok=True)
+
+    # A voice that is not there must be reported, never raised as a crash --
+    # and it must fail before loading, or this would cost another model load.
+    saved_path, saved_voice = tts.settings.piper_voice, tts._PIPER_VOICE
+    try:
+        tts.settings.piper_voice = str(
+            Path(tempfile.gettempdir()) / "apache-definitely-missing.onnx"
+        )
+        tts._PIPER_VOICE = None
+        try:
+            tts.synthesize("hi", out)
+            outcome = "NO ERROR"
+        except tts.TTSUnavailable as exc:
+            outcome = str(exc)
+        check("a missing voice is reported, not fatal",
+              "no offline voice" in outcome, outcome)
+    finally:
+        tts.settings.piper_voice, tts._PIPER_VOICE = saved_path, saved_voice
+        out.unlink(missing_ok=True)
+
+
 def test_thinking_animation() -> None:
     """A bubble the model has not answered yet must visibly move."""
     _g, _b, ui, _ = _load_stack()
@@ -439,7 +577,7 @@ def test_thinking_animation() -> None:
         assistant._history = [{"role": "assistant", "content": ""}]
         assistant._busy = True
     try:
-        rendered = by_name["on_tick"](None)[0]
+        rendered = by_name["on_tick"]()[0]
         last = rendered[-1] if rendered else {}
         check("on_tick animates the pending bubble",
               "apache-thinking" in str(last.get("content", "")),
@@ -558,6 +696,8 @@ def main() -> int:
         test_agent_turn_degrades_cleanly,
         test_listener_diagnostics,
         test_capture_feeds_vad,
+        test_audio_queue,
+        test_offline_speech,
         test_thinking_animation,
         test_presence_prompts,
         # Kept last: it resets the shared conversation.

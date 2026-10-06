@@ -55,6 +55,24 @@ works fine.
 python -m pip install -r requirements.txt
 ```
 
+### Fetch the speech models (once)
+
+Voice runs offline by default, so the two engines need their models on disk
+once per machine. Whisper downloads itself into `models/whisper` the first time
+it is asked for; the Piper voice is a direct download:
+
+```powershell
+New-Item -ItemType Directory -Force models\piper | Out-Null
+$base = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium"
+Invoke-WebRequest "$base/en_US-ryan-medium.onnx"      -OutFile models\piper\en_US-ryan-medium.onnx
+Invoke-WebRequest "$base/en_US-ryan-medium.onnx.json" -OutFile models\piper\en_US-ryan-medium.onnx.json
+```
+
+`models/` is gitignored. If the voice is missing, Apache still runs and still
+answers in the chat — `run.py --check` reports it as a line of its own, and the
+usual symptom otherwise is an assistant that never speaks. Set
+`APACHE_OFFLINE=0` to use Google and edge-tts instead, which need no models.
+
 ---
 
 ## Verify before you start
@@ -63,8 +81,9 @@ python -m pip install -r requirements.txt
 python run.py --check
 ```
 
-This imports every dependency for real and probes Ollama, the microphone and
-the two network services the voice path needs. It distinguishes a **missing**
+This imports every dependency for real and probes Ollama, the microphone, the
+local speech models, and the network endpoints the online fallback depends on.
+It distinguishes a **missing**
 package from a **blocked** one — if Windows Smart App Control is enforcing,
 the unsigned native extensions that PyPI wheels ship (`pydantic_core`,
 `numpy`, `_cffi_backend`) are refused at load time, and the report says so
@@ -106,6 +125,10 @@ Every setting can be overridden with an `APACHE_`-prefixed environment variable
 | Variable | Default | Meaning |
 |---|---|---|
 | `APACHE_MODEL` | `qwen3:1.7b` | Ollama chat model |
+| `APACHE_OFFLINE` | `1` | Local speech engines; `0` switches to Google + edge-tts |
+| `APACHE_WHISPER_MODEL` | `base.en` | Local recogniser; `small.en` is more accurate, about twice as slow |
+| `APACHE_PIPER_VOICE` | `models/piper/en_US-ryan-medium.onnx` | Local voice file for spoken replies |
+| `APACHE_MIC_AUTOSTART` | `1` | Open the microphone as soon as the page opens |
 | `APACHE_EMBEDDING_MODEL` | `nomic-embed-text` | RAG embedding model |
 | `APACHE_OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint |
 | `APACHE_OLLAMA_KEEP_ALIVE` | `-1` | How long Ollama keeps the model resident; `-1` is forever |
@@ -297,12 +320,21 @@ Only run this on a machine you are willing to let the model execute code on.
 outside `data/workspace`, including `..`, absolute paths and symlinks. The
 Python sandbox deliberately has no such restriction.
 
-### Everything local except three network calls
+### Offline by default
 
-Ollama, your documents and your files stay on your machine. Three things go
-out: Google speech recognition (microphone audio), Edge TTS (the text of your
-reply), and DuckDuckGo when `web_search` is called. Turn spoken replies off in
-the **Voice** tab if you would rather not send reply text for synthesis.
+Voice runs locally: **faster-whisper** transcribes the microphone and **piper**
+synthesises replies from a model in `models/`. Nothing in the voice path leaves
+the machine, there is no round trip per utterance or per reply, and recognition
+is not throttled after a burst of queries — all three of which made voice feel
+slow or intermittently silent when it depended on the network.
+
+`APACHE_OFFLINE=0` puts Google speech recognition and Edge TTS back in charge.
+They are a little more accurate on noisy input, and they need the network; the
+engine is chosen once at startup, so switching means a restart.
+
+What still goes out in the default configuration: **DuckDuckGo**, and only when
+the model chooses to call `web_search`. Ollama, your documents and your files
+stay on your machine.
 
 ### No barge-in: one spoken command at a time
 
@@ -380,6 +412,8 @@ its own system applications — use the Windows Security toggle instead.
 | Documents answer weakly | `ollama pull nomic-embed-text`, then re-upload |
 | No wake word response | Check the **Voice** panel state; the mic may be muted, stopped, or have hit repeated STT failures |
 | `Speech recognition failed` repeatedly | The listener stops after 5 consecutive failures to avoid spinning; restart it with the mic button |
-| No spoken replies | Check the network, or untick **Speak replies aloud** |
+| No spoken replies | Untick **Speak replies aloud** only if you meant to. Otherwise run `run.py --check` and read the **Speech models** line — a missing Piper voice fails silently, and Apache looks perfectly healthy while saying nothing |
+| Microphone never starts by itself | `APACHE_MIC_AUTOSTART=1` is the default; the **Voice** panel reports a device that refused to open |
+| Voice input is slow or stops after a burst | That was Google throttling recognitions. Offline mode (`APACHE_OFFLINE=1`) has no endpoint to throttle |
 | `pip.exe` is blocked | Use `python -m pip` instead |
 | Native imports fail / "Application Control has blocked this file" | Run `python run.py --check`; likely Smart App Control — see *Windows Smart App Control* above |

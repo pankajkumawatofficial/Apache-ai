@@ -14,6 +14,7 @@ copy of the conversation to keep in sync.
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any, Iterator
 
@@ -166,8 +167,12 @@ def _settings_status_text(assistant: Assistant, ollama: Any = None) -> str:
 
 
 def _render(snapshot: Snapshot) -> tuple[Any, Any, Any, Any]:
-    messages, activity, audio, status = snapshot
-    return messages, activity, audio, status
+    messages, activity, _audio, status = snapshot
+    # Audio is released only by the ticker, through Assistant.next_audio().
+    # Returning it here meant any handler -- uploading a document, applying a
+    # setting, resetting -- could push an already-played clip back in front of
+    # one that had never been heard.
+    return messages, activity, gr.skip(), status
 
 
 #: Spinner frames for a bubble the model has not answered yet. The frame is
@@ -257,8 +262,6 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
     # Gradio 6 takes css on launch(), not on the constructor.
     with gr.Blocks(title="Apache", fill_height=True) as demo:
         gr.Markdown(_HEADER)
-
-        audio_state = gr.State(None)
 
         with gr.Row():
             # ---------------- chat column ----------------
@@ -395,24 +398,26 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
         # ----------------------------------------------------------
         def on_send(message: str) -> Iterator[tuple]:
             text = (message or "").strip()
-            messages, act, audio, stat = assistant.snapshot()
+            messages, act, _audio, stat = assistant.snapshot()
             if not text:
                 yield messages, act, gr.skip(), stat, ""
                 return
 
-            seen = audio
             for snapshot in assistant.submit(text):
-                messages, act, audio, stat = snapshot
-                audio_out = audio if audio != seen else gr.skip()
-                seen = audio
-                yield messages, act, audio_out, stat, ""
+                messages, act, _audio, stat = snapshot
+                # The ticker owns audio. Yielding it here could replay a clip
+                # that had already played, or hide one queued behind it.
+                yield messages, act, gr.skip(), stat, ""
 
-        def on_tick(last_audio: Any) -> tuple:
-            messages, act, audio, stat = _render(assistant.snapshot())
+        def on_tick() -> tuple:
+            messages, act, _audio, stat = _render(assistant.snapshot())
             # The timer is the only thing running while the model is silent,
             # so it is what drives the animation in a pending bubble.
             messages = _with_thinking(messages, assistant.busy)
-            audio_out = audio if audio != last_audio else gr.skip()
+            # One clip per tick at most, and none while the last is still
+            # playing -- see Assistant.next_audio.
+            clip = assistant.next_audio()
+            audio_out = clip if clip else gr.skip()
             busy = assistant.busy
             return (
                 messages,
@@ -420,7 +425,6 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
                 audio_out,
                 stat,
                 _voice_status_text(listener),
-                audio,
                 # Stop only makes sense mid-turn; Send is greyed out so a
                 # second click cannot race the busy flag.
                 gr.update(interactive=busy),
@@ -484,6 +488,12 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
 
         def on_load() -> tuple:
             status = check_ollama()
+            # Listening from the moment the page opens. The whole point of the
+            # app is saying "Apache", and requiring a first click left it
+            # feeling half-started; a machine with no usable input device
+            # reports itself through the status line instead of raising.
+            if assistant.settings.mic_autostart and not listener.running:
+                listener.start()
             running = listener.running
             return (
                 _settings_status_text(assistant, status),
@@ -514,14 +524,13 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
         timer = gr.Timer(0.6)
         timer.tick(
             on_tick,
-            inputs=audio_state,
+            inputs=[],
             outputs=[
                 chatbot,
                 activity,
                 voice_audio,
                 status,
                 voice_status,
-                audio_state,
                 stop,
                 send,
             ],
@@ -567,9 +576,22 @@ def build_and_launch(
     share: bool = False,
 ) -> None:
     demo = build_demo(assistant)
-    # Only the real launcher speaks. Tests build demos too, and must not open
-    # a network TTS call or leave a thread running behind them.
-    (assistant or get_assistant()).start_prompts()
+    # Only the real launcher speaks or listens. Tests build demos too, and
+    # must not open a TTS call, a microphone, or a thread behind themselves.
+    app = assistant or get_assistant()
+
+    # Warm the offline voice and recogniser in the background. Both cost a
+    # few seconds the first time (model load plus one-off graph planning), and
+    # the greeting queues behind the voice on the same lock -- so the first
+    # thing Apache says arrives as a short clip rather than after a long
+    # silence, and the first query does not stall on loading Whisper.
+    from .voice import stt, tts
+
+    for _warm in (tts.warm_up, stt.warm_up):
+        threading.Thread(target=_warm, name=f"apache-{_warm.__module__}-warmup",
+                         daemon=True).start()
+    app.start_prompts()
+
     demo.launch(
         server_name=server_name,
         server_port=server_port,

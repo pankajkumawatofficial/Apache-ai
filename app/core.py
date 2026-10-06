@@ -51,6 +51,15 @@ class Assistant:
         self._history: list[dict[str, str]] = welcome_history()
         self._activity: list[str] = []
         self._audio: str | None = None
+        #: Clips waiting to be played, each paired with the duration estimated
+        #: for it. One slot was not enough: a greeting, an idle check-in and
+        #: an answer can each finish synthesising inside the same 0.6 s tick,
+        #: and every write overwrote the clip before the browser had seen it.
+        #: That is how a reply ended up never spoken.
+        self._audio_queue: list[tuple[str, float]] = []
+        #: When the clip now playing has had time to finish. Keeps playback
+        #: sequential instead of the next clip cutting the previous one off.
+        self._audio_free_at = 0.0
         self._status = "Ready."
         self._busy = False
         self._turn = 0
@@ -404,9 +413,16 @@ class Assistant:
     # Voice output
     # ------------------------------------------------------------------
     def _synthesize(self, reply: str) -> None:
-        from .voice.tts import TTSUnavailable, estimate_duration_s, synthesize
+        from .voice.tts import (
+            TTSUnavailable,
+            clip_extension,
+            estimate_duration_s,
+            synthesize,
+        )
 
-        clip = AUDIO / f"reply-{self._turn}-{uuid.uuid4().hex[:8]}.mp3"
+        # The suffix follows the engine: a Piper WAV named .mp3 would fail to
+        # decode in the browser, which looks exactly like Apache not speaking.
+        clip = AUDIO / f"reply-{self._turn}-{uuid.uuid4().hex[:8]}{clip_extension()}"
         try:
             path = synthesize(reply, clip, voice=self.voice, rate=self.settings.tts_rate)
         except TTSUnavailable as exc:
@@ -419,16 +435,45 @@ class Assistant:
         duration = estimate_duration_s(reply)
         self._prune_audio()
         with self._lock:
-            self._audio = str(path)
+            # Queued, not assigned: next_audio() releases it once whatever is
+            # playing has had time to finish.
+            self._audio_queue.append((str(path), duration))
         if self.on_reply_audio is not None:
             try:
                 self.on_reply_audio(str(path), duration)
             except Exception:  # noqa: BLE001 - mic control is best effort
                 pass
 
+    def next_audio(self) -> str | None:
+        """Return the next clip to play, or ``None`` when it is not yet time.
+
+        Every reply and every announcement lands in one queue, and they can
+        finish synthesising within a single tick -- the greeting, an idle
+        check-in and an answer all at once. A single slot let each overwrite
+        the last before the browser had seen it, which is how a response ended
+        up never spoken at all.
+
+        Clips are released on their estimated duration, so the next one waits
+        for the current one rather than cutting it off.
+        """
+        with self._lock:
+            now = time.monotonic()
+            if now < self._audio_free_at or not self._audio_queue:
+                return None
+            path, duration = self._audio_queue.pop(0)
+            # A floor so a very short clip is not replaced by the next tick.
+            self._audio_free_at = now + max(duration, 0.5)
+            self._audio = path
+            return path
+
+    def pending_audio(self) -> int:
+        """How many clips are queued and not yet handed out."""
+        with self._lock:
+            return len(self._audio_queue)
+
     def _prune_audio(self) -> None:
         try:
-            clips = sorted(AUDIO.glob("reply-*.mp3"), key=lambda p: p.stat().st_mtime)
+            clips = sorted(AUDIO.glob("reply-*.*"), key=lambda p: p.stat().st_mtime)
             for stale in clips[:-_MAX_AUDIO_CLIPS]:
                 stale.unlink(missing_ok=True)
         except OSError:

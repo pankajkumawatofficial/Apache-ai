@@ -9,12 +9,20 @@ langchain-ollama>=1.1,<2.0
 # --- UI ---
 gradio>=6.0,<7.0
 
-# --- Voice: speech-to-text (Google, online) ---
+# --- Voice: speech-to-text ---
+# Offline is the default: faster-whisper runs a local model. It downloads
+# ~75 MB on first use into models/whisper, then needs no network at all.
+faster-whisper>=1.2,<2.0
+# The online fallback (APACHE_OFFLINE=0): Google's free web endpoint.
 SpeechRecognition>=3.14
 # Python 3.13+ removed audioop from the stdlib; SpeechRecognition needs it.
 audioop-lts>=0.2.2; python_version >= "3.13"
 
-# --- Voice: text-to-speech (Microsoft Edge neural voices, online) ---
+# --- Voice: text-to-speech ---
+# Offline is the default: piper synthesises from a local ONNX voice in
+# models/piper (see README for the one-time download).
+piper-tts>=1.8,<2.0
+# The online fallback (APACHE_OFFLINE=0): Microsoft Edge neural voices.
 edge-tts>=7.0
 
 # --- Voice: continuous microphone capture (server side) ---

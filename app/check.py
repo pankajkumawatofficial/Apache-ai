@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 
 BLOCK_SIGNATURE = "Application Control policy has blocked"
 
@@ -47,30 +48,37 @@ def sac_mode() -> tuple[int | None, str]:
         return None, "unknown"
     return value, SAC_STATES.get(value, f"state {value}")
 
-#: (import name, what it is for)
-DEPENDENCIES: list[tuple[str, str]] = [
-    ("gradio", "web UI"),
-    ("pydantic", "required by LangChain"),
-    ("langchain", "agent loop"),
-    ("langchain.agents", "create_agent"),
-    ("langchain_ollama", "Ollama model integration"),
-    ("langgraph", "agent runtime"),
-    ("langgraph.checkpoint.memory", "conversation memory"),
-    ("langchain_text_splitters", "document chunking"),
-    ("numpy", "required by Gradio and audio handling"),
-    ("sounddevice", "microphone capture"),
-    ("speech_recognition", "speech to text"),
-    ("edge_tts", "text to speech"),
-    ("pypdf", "PDF ingestion"),
-    ("ddgs", "web search tool"),
+#: (import name, what it is for, required)
+DEPENDENCIES: list[tuple[str, str, bool]] = [
+    ("gradio", "web UI", True),
+    ("pydantic", "required by LangChain", True),
+    ("langchain", "agent loop", True),
+    ("langchain.agents", "create_agent", True),
+    ("langchain_ollama", "Ollama model integration", True),
+    ("langgraph", "agent runtime", True),
+    ("langgraph.checkpoint.memory", "conversation memory", True),
+    ("langchain_text_splitters", "document chunking", True),
+    ("numpy", "required by Gradio and audio handling", True),
+    ("sounddevice", "microphone capture", True),
+    # Offline speech is the default and these two carry it.
+    ("faster_whisper", "speech to text, offline", True),
+    ("piper", "text to speech, offline", True),
+    # Only used when APACHE_OFFLINE=0.
+    ("speech_recognition", "speech to text, online fallback", False),
+    ("edge_tts", "text to speech, online fallback", False),
+    ("pypdf", "PDF ingestion", True),
+    ("ddgs", "web search tool", False),
 ]
 
-#: (label, url, what breaks without it)
-ENDPOINTS: list[tuple[str, str, str]] = [
-    ("Ollama", "http://localhost:11434/api/tags", "the model itself"),
+#: (label, url, what breaks without it, required)
+#: Google and Edge are reachability checks for the online fallback only, so
+#: they must not fail the report on a machine that is offline by design.
+ENDPOINTS: list[tuple[str, str, str, bool]] = [
+    ("Ollama", "http://localhost:11434/api/tags", "the model itself", True),
     ("Google STT", "http://www.google.com/speech-api/v2/recognize",
-     "wake word and voice input"),
-    ("Edge TTS", "https://speech.platform.bing.com/", "spoken replies"),
+     "voice input when APACHE_OFFLINE=0", False),
+    ("Edge TTS", "https://speech.platform.bing.com/",
+     "spoken replies when APACHE_OFFLINE=0", False),
 ]
 
 
@@ -84,7 +92,7 @@ class CheckResult:
     notes: list[str] = field(default_factory=list)
 
 
-def _check_import(name: str, purpose: str) -> CheckResult:
+def _check_import(name: str, purpose: str, required: bool = True) -> CheckResult:
     try:
         importlib.import_module(name)
     except ImportError as exc:
@@ -109,16 +117,17 @@ def _check_import(name: str, purpose: str) -> CheckResult:
                 )
         else:
             detail = f"not importable: {message[:220]}"
-        return CheckResult(name, False, detail, blocked=blocked)
+        return CheckResult(name, False, detail, blocked=blocked, required=required)
     except Exception as exc:  # noqa: BLE001 - any failure is a failure
         return CheckResult(
-            name, False, f"raised {type(exc).__name__}: {str(exc)[:220]}"
+            name, False, f"raised {type(exc).__name__}: {str(exc)[:220]}",
+            required=required,
         )
-    return CheckResult(name, True, f"importable ({purpose})")
+    return CheckResult(name, True, f"importable ({purpose})", required=required)
 
 
 def _check_endpoint(label: str, url: str, consequence: str,
-                    timeout: float = 4.0) -> CheckResult:
+                    timeout: float = 4.0, required: bool = True) -> CheckResult:
     request = urllib.request.Request(  # noqa: S310 - fixed known endpoints
         url, method="GET", headers={"User-Agent": "apache-selfcheck/1.0"}
     )
@@ -131,6 +140,7 @@ def _check_endpoint(label: str, url: str, consequence: str,
     except Exception as exc:  # noqa: BLE001
         return CheckResult(
             label, False, f"unreachable: {str(exc)[:160]}",
+            required=required,
             notes=[f"Without it: {consequence}"],
         )
     return CheckResult(label, True, "reachable")
@@ -166,6 +176,38 @@ def _check_audio() -> CheckResult:
     )
 
 
+def _check_speech_models() -> CheckResult:
+    """Offline engines are no use without their models on disk.
+
+    A missing Piper voice is silent failure rather than a crash -- Apache
+    looks perfectly healthy and simply never speaks -- so it is worth a line
+    of its own in the report.
+    """
+    from .config import settings
+
+    if not settings.offline:
+        return CheckResult("Speech models", True,
+                           "not needed (APACHE_OFFLINE=0)", required=False)
+
+    voice = Path(settings.piper_voice)
+    if not voice.exists():
+        return CheckResult(
+            "Speech models", False, f"no Piper voice at {voice}",
+            required=False,
+            notes=["Without it: Apache stays silent. Fetch the voice once "
+                   "following the README, or set APACHE_OFFLINE=0."],
+        )
+
+    root = Path(settings.whisper_dir)
+    cached = list(root.glob("*faster-whisper*")) if root.exists() else []
+    if not cached:
+        detail = (f"Piper ready; {settings.whisper_model} downloads on first "
+                  f"use into {root}")
+    else:
+        detail = f"Piper ready; {settings.whisper_model} cached"
+    return CheckResult("Speech models", True, detail, required=False)
+
+
 def collect() -> list[CheckResult]:
     results: list[CheckResult] = []
 
@@ -177,13 +219,14 @@ def collect() -> list[CheckResult]:
         CheckResult("Platform", True, f"{platform.system()} {platform.release()}")
     )
 
-    for name, purpose in DEPENDENCIES:
-        results.append(_check_import(name, purpose))
+    for name, purpose, required in DEPENDENCIES:
+        results.append(_check_import(name, purpose, required))
 
-    for label, url, consequence in ENDPOINTS:
-        results.append(_check_endpoint(label, url, consequence))
+    for label, url, consequence, required in ENDPOINTS:
+        results.append(_check_endpoint(label, url, consequence, required=required))
 
     results.append(_check_audio())
+    results.append(_check_speech_models())
     return results
 
 

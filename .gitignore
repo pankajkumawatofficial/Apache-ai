@@ -11,6 +11,9 @@ data/workspace/*
 data/audio/*
 !data/**/.gitkeep
 
+# Downloaded speech models (tens of MB, fetched once per machine)
+models/
+
 # Editors / OS
 .vscode/
 .idea/

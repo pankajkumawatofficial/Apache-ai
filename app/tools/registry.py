@@ -18,6 +18,7 @@ from typing import Any
 from ..config import Settings, settings as default_settings
 from ..rag import DocumentStore, format_hits
 from .calculator import CalcError, safe_eval
+from .control import ControlError, open_file, open_url
 from .files import FileAccessError, list_files, read_file, write_file
 from .sandbox import run_python
 
@@ -143,6 +144,33 @@ def build_tools(
         now = datetime.datetime.now().astimezone()
         return now.strftime("%A, %d %B %Y %H:%M:%S %Z (UTC%z)")
 
+    @tool
+    def open_url_tool(url: str) -> str:
+        """Open a web page in the default browser.
+
+        Use this whenever the user wants to watch or read something online:
+        "open YouTube", "go to gmail", "open github.com". Pass the address;
+        https:// is added when it is missing. Only http and https are opened.
+        """
+        try:
+            return open_url(url)
+        except ControlError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def open_file_tool(path: str) -> str:
+        """Open a file or folder with the program Windows associates with it.
+
+        The path may be absolute ("C:\\Users\\me\\Videos") or relative to the
+        assistant's workspace; pass "." for the workspace root. Folders open in
+        File Explorer, documents in their own program. Refuses to run
+        programs -- this reaches things, it does not start applications.
+        """
+        try:
+            return open_file(path, root)
+        except ControlError as exc:
+            return f"Error: {exc}"
+
     tools: list[Any] = [
         calculator,
         run_python_code,
@@ -151,6 +179,8 @@ def build_tools(
         write_file_tool,
         search_documents,
         current_datetime,
+        open_url_tool,
+        open_file_tool,
     ]
 
     if include_web:
