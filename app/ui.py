@@ -24,6 +24,7 @@ from .config import DEFAULT_WAKE_ALIASES, settings
 from .core import Assistant, Snapshot, get_assistant
 from .llm import check_ollama
 from .voice.listener import WakeListener, list_input_devices
+from .voice.tts import clip_extension
 
 __all__ = ["build_demo", "build_and_launch"]
 
@@ -41,8 +42,10 @@ TTS_VOICES = [
 ]
 
 _HEADER = """\
-# Apache
-**Local voice assistant** — LangChain agent · Ollama · Gradio · edge-tts
+# APACHE
+**Local voice assistant — HUD online**
+
+LangChain agent · Ollama · faster-whisper · piper · fully local
 """
 
 
@@ -183,15 +186,298 @@ _THINKING_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 #: Applied to the pending bubble. Kept gentle: this is a status cue, not a
 #: distraction, and it must stay readable in a dark terminal-style theme.
 _CSS = """
+/* ==========================================================================
+   JARVIS / Iron Man HUD theme.
+
+   A presentational layer and nothing else: every rule either redeclares a
+   design token Gradio already resolves its colours from, or styles an element
+   this app owns (#apache-header, #apache-chat, .apache-thinking). That is the
+   point -- recolouring the tokens retints the entire application without
+   depending on Gradio's hashed Svelte class names, which change on release,
+   so no behaviour can be disturbed by the theme.
+   ========================================================================== */
+
+/* --- 1. Base --------------------------------------------------------------- */
+html, body {
+    background-color: #04070d !important;
+    /* A scanline the eye registers more as texture than as lines. */
+    background-image: repeating-linear-gradient(
+        180deg,
+        rgba(0, 229, 255, .022) 0 1px,
+        transparent 1px 4px
+    ) !important;
+    background-attachment: fixed !important;
+}
+
+.gradio-container {
+    --body-background-fill: #04070d;
+    --background-fill-primary: #070d17;
+    --background-fill-secondary: #0a1322;
+    --block-background-fill: #0a1322;
+    --input-background-fill: #050a12;
+    --input-border-color: rgba(0, 229, 255, .26);
+    --border-color-primary: rgba(0, 229, 255, .20);
+    --body-text-color: #cfe9f5;
+    --body-text-color-subdued: #7d97ab;
+    --block-label-text-color: #63d3e8;
+    --link-text-color: #4fe3ff;
+    --link-text-color-hover: #a8f4ff;
+    --link-text-color-visited: #4fe3ff;
+    --color-accent: #00e5ff;
+    --color-accent-soft: 0, 229, 255;
+    --primary-500: #00e5ff;
+    --primary-600: #00b8d4;
+    --button-primary-background-fill: #062831;
+    --button-primary-background-fill-hover: #0a4757;
+    --button-primary-border-color: #00e5ff;
+    --button-primary-border-color-hover: #6ff3ff;
+    --button-primary-text-color: #a8f4ff;
+    --button-primary-text-color-hover: #ffffff;
+    --button-secondary-background-fill: #0a1322;
+    --button-secondary-background-fill-hover: #12233a;
+    --button-secondary-border-color: rgba(0, 229, 255, .32);
+    --button-secondary-text-color: #a8f4ff;
+    --button-cancel-background-fill: #2a1015;
+    --button-cancel-border-color: rgba(255, 120, 120, .55);
+    --button-cancel-text-color: #ff9d9d;
+    --font-mono: "JetBrains Mono", "Cascadia Mono", ui-monospace,
+                 SFMono-Regular, Menlo, monospace;
+    background: #04070d;
+    color: #cfe9f5;
+}
+
+/* --- 2. The banner --------------------------------------------------------- */
+#apache-header {
+    position: relative;
+    margin: 2px 0 16px;
+    padding: 20px 24px 16px;
+    background:
+        linear-gradient(180deg, rgba(0, 229, 255, .07), rgba(0, 229, 255, 0) 72%),
+        #070d17;
+    border: 1px solid rgba(0, 229, 255, .30);
+    border-radius: 3px;
+    box-shadow:
+        0 0 30px rgba(0, 229, 255, .10),
+        inset 0 0 50px rgba(0, 229, 255, .04);
+}
+/* Two corner ticks read as a HUD frame without needing four. */
+#apache-header::before,
+#apache-header::after {
+    content: "";
+    position: absolute;
+    width: 18px;
+    height: 18px;
+    border: 2px solid #00e5ff;
+    opacity: .9;
+}
+#apache-header::before {
+    top: -1px;
+    left: -1px;
+    border-right: 0;
+    border-bottom: 0;
+}
+#apache-header::after {
+    right: -1px;
+    bottom: -1px;
+    border-left: 0;
+    border-top: 0;
+}
+#apache-header h1 {
+    margin: 0;
+    color: #eafcff;
+    font-size: 2rem;
+    font-weight: 700;
+    letter-spacing: .34em;
+    text-transform: uppercase;
+    text-shadow:
+        0 0 12px rgba(0, 229, 255, .8),
+        0 0 36px rgba(0, 229, 255, .35);
+}
+#apache-header p {
+    margin: 8px 0 0;
+    color: #6fd8ea;
+    font-family: var(--font-mono);
+    font-size: .78rem;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+}
+#apache-header p strong { color: #a8f4ff; font-weight: 600; }
+#apache-header p + p { margin-top: 4px; color: #4d6b80; }
+
+/* --- 3. Conversation ------------------------------------------------------- */
+/* Each entry is a console line: a dark panel behind a cyan rail. */
+#apache-chat .bubble {
+    background: rgba(10, 19, 34, .9);
+    border: 1px solid rgba(0, 229, 255, .16);
+    border-left: 2px solid rgba(0, 229, 255, .55);
+    border-radius: 2px;
+    transition: border-color .18s ease, box-shadow .18s ease;
+}
+#apache-chat .bubble:hover {
+    border-color: rgba(0, 229, 255, .42);
+    box-shadow: 0 0 20px rgba(0, 229, 255, .14);
+}
+#apache-chat .bubble a { color: #4fe3ff; }
+#apache-chat .bubble a:hover { color: #a8f4ff; }
+#apache-chat .bubble code {
+    background: #050a12;
+    border: 1px solid rgba(0, 229, 255, .20);
+    color: #8ef1ff;
+    font-family: var(--font-mono);
+}
+#apache-chat .bubble pre {
+    background: #050a12;
+    border: 1px solid rgba(0, 229, 255, .22);
+}
+#apache-chat .bubble pre code {
+    background: transparent;
+    border: 0;
+    color: #b9e9f5;
+}
+
+/* --- 4. Inputs ------------------------------------------------------------- */
+.gradio-container textarea,
+.gradio-container input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+.gradio-container select {
+    background: #050a12 !important;
+    border-color: rgba(0, 229, 255, .26) !important;
+    color: #dff6ff;
+}
+.gradio-container textarea::placeholder,
+.gradio-container input::placeholder {
+    color: #4d6b80;
+}
+.gradio-container textarea:focus,
+.gradio-container input:focus,
+.gradio-container select:focus {
+    border-color: #00e5ff !important;
+    outline: none;
+    box-shadow:
+        0 0 0 1px rgba(0, 229, 255, .45),
+        0 0 20px rgba(0, 229, 255, .30) !important;
+}
+
+/* --- 5. Buttons ------------------------------------------------------------ */
+.gradio-container button {
+    text-transform: uppercase;
+    letter-spacing: .13em;
+    font-size: .76rem;
+    font-weight: 600;
+}
+.gradio-container button.primary {
+    background: linear-gradient(180deg, #0a4757, #062831) !important;
+    border-color: #00e5ff !important;
+    color: #a8f4ff !important;
+    text-shadow: 0 0 10px rgba(0, 229, 255, .6);
+    box-shadow:
+        0 0 18px rgba(0, 229, 255, .22),
+        inset 0 0 14px rgba(0, 229, 255, .10);
+    transition: box-shadow .18s ease, color .18s ease;
+}
+.gradio-container button.primary:hover:not(:disabled) {
+    color: #ffffff !important;
+    box-shadow:
+        0 0 30px rgba(0, 229, 255, .5),
+        inset 0 0 18px rgba(0, 229, 255, .18);
+}
+.gradio-container button.primary:disabled {
+    opacity: .35;
+    box-shadow: none;
+}
+.gradio-container button.secondary {
+    border-color: rgba(0, 229, 255, .32) !important;
+    color: #a8f4ff !important;
+}
+.gradio-container button.stop {
+    border-color: rgba(255, 120, 120, .55) !important;
+    color: #ff9d9d !important;
+    text-shadow: none;
+}
+
+/* --- 6. Labels and tabs read as instrument text ---------------------------- */
+.gradio-container label {
+    color: #63d3e8;
+    font-family: var(--font-mono);
+    font-size: .74rem;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+}
+.gradio-container [role="tab"] {
+    color: #7d97ab;
+    font-family: var(--font-mono);
+    font-size: .74rem;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    transition: color .16s ease;
+}
+.gradio-container [role="tab"][aria-selected="true"],
+.gradio-container [role="tab"].selected {
+    color: #00e5ff;
+    text-shadow: 0 0 12px rgba(0, 229, 255, .65);
+}
+
+/* --- 7. Thinking ----------------------------------------------------------- */
+/* The spinner glows rather than merely fading, so "working" reads at a glance. */
 .apache-thinking {
     display: inline-block;
+    color: #4fe3ff;
+    font-family: var(--font-mono);
+    letter-spacing: .14em;
     animation: apache-think 1.15s ease-in-out infinite;
 }
 @keyframes apache-think {
-    0%, 100% { opacity: .30; letter-spacing: .02em; }
-    50%      { opacity: 1;   letter-spacing: .12em; }
+    0%, 100% {
+        opacity: .30;
+        letter-spacing: .02em;
+        text-shadow: 0 0 4px rgba(0, 229, 255, .25);
+    }
+    50% {
+        opacity: 1;
+        letter-spacing: .12em;
+        text-shadow: 0 0 18px rgba(0, 229, 255, .85);
+    }
+}
+
+/* --- 8. Scrollbars --------------------------------------------------------- */
+.gradio-container ::-webkit-scrollbar { width: 10px; height: 10px; }
+.gradio-container ::-webkit-scrollbar-track { background: #050a12; }
+.gradio-container ::-webkit-scrollbar-thumb {
+    background: rgba(0, 229, 255, .30);
+    border: 2px solid #050a12;
+    border-radius: 0;
+}
+.gradio-container ::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 229, 255, .60);
+}
+
+/* --- 9. Footer ------------------------------------------------------------- */
+.gradio-container footer,
+.gradio-container .footer {
+    color: #4d6b80 !important;
 }
 """
+
+
+def _theme():
+    """The Gradio theme the HUD stylesheet sits on top of.
+
+    Gradio derives its stylesheet from this object, which is what makes
+    buttons, focus rings, sliders and checked boxes come out cyan rather than
+    the default orange -- something raw CSS cannot express reliably, because
+    several of those are generated rather than declared. The custom CSS adds
+    only what a theme has no notion of: the banner frame, the console-style
+    bubbles, and the glow.
+
+    It goes to ``launch()``, not to the ``Blocks`` constructor: Gradio 6 marks
+    ``Blocks(theme=...)`` deprecated and drops it, so passing it there would
+    silently do nothing.
+    """
+    return gr.themes.Base(
+        primary_hue="cyan",
+        secondary_hue="cyan",
+        neutral_hue="slate",
+        radius_size=gr.themes.utils.sizes.radius_sm,
+    )
 
 
 def _thinking_html() -> str:
@@ -261,7 +547,9 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
 
     # Gradio 6 takes css on launch(), not on the constructor.
     with gr.Blocks(title="Apache", fill_height=True) as demo:
-        gr.Markdown(_HEADER)
+        # An elem_id so the HUD header can be styled precisely rather than by
+        # guessing at Gradio's hashed Svelte class names.
+        gr.Markdown(_HEADER, elem_id="apache-header")
 
         with gr.Row():
             # ---------------- chat column ----------------
@@ -272,6 +560,7 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
                     height=480,
                     layout="bubble",
                     placeholder="Ask something, or say “Apache, …”",
+                    elem_id="apache-chat",
                 )
                 activity = gr.Textbox(
                     value="",
@@ -308,7 +597,11 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
                     value=None,
                     label="Voice reply",
                     type="filepath",
-                    format="mp3",
+                    # Must match what synthesize() actually wrote: claiming mp3
+                    # while holding a WAV invites a conversion Gradio can only
+                    # do if ffmpeg happens to be installed, and a failed
+                    # conversion is silent -- the reply simply never plays.
+                    format=clip_extension().lstrip("."),
                     autoplay=True,
                     interactive=False,
                     show_label=True,
@@ -598,6 +891,7 @@ def build_and_launch(
         inbrowser=inbrowser,
         share=share,
         show_error=True,
+        theme=_theme(),
         css=_CSS,
         allowed_paths=[str(assistant.workspace) if assistant else "."],
     )

@@ -240,6 +240,26 @@ utterances discarded because Apache was busy are all counted and shown in the
 voice panel, alongside a live input level against the current VAD gate. "It is
 not hearing me" becomes a readable diagnosis instead of a guess.
 
+**Every reply is queued, never overwritten.** Replies and announcements — the
+greeting, an idle check-in, an answer — all land in one queue carrying the
+duration estimated for each, and `Assistant.next_audio()` releases the next
+only once the previous could have finished. A single slot was not enough:
+three clips can finish synthesising inside one 0.6 s tick, and each write
+overwrote the clip before the browser had seen it, so two of three went unsaid.
+Releases are timed, so playback runs on rather than being cut off, and the
+ticker is the only thing that hands audio out — no upload or settings handler
+can push a clip that already played back in front of one that never did.
+
+**The player's `format` must match the clip's suffix.** Gradio re-encodes an
+audio path only when its extension disagrees with the component's `format`
+(`components/audio.py:320`), and that re-encode shells out to ffmpeg through
+pydub. There is no ffmpeg on this machine, so a component still claiming
+`mp3` while Piper was writing `.wav` made every reply die as a
+`ComponentProcessingError` inside `on_tick` — Apache looked perfectly healthy
+and simply never spoke. The player asks `clip_extension()` for the engine's
+real format, so the file is served untouched. Swap engines and this is the
+silent one to watch for.
+
 **The gate sits above the room, not above your voice.** The speech gate is the
 noise floor times a multiplier, and at 3.5 it measured `0.0283` against a room
 level of `0.0073` -- 3.9x ambient, which an ordinary voice does not sustain

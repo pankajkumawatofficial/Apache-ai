@@ -588,6 +588,113 @@ def test_thinking_animation() -> None:
             assistant._history = saved
 
 
+def test_jarvis_theme() -> None:
+    """The HUD is wired into the app, not merely written down.
+
+    A stylesheet nobody passes to ``launch()`` looks finished and does
+    nothing, which is the failure this exists to catch.
+    """
+    get_assistant, _, _, _ = _load_stack()
+    get_assistant()
+
+    import gradio as gr
+
+    from app import ui
+
+    demo = ui.build_demo(get_assistant())
+    # str(demo) never renders elem_id; the config Gradio serves is the thing
+    # that actually reaches the browser, so that is what to assert against.
+    import json
+
+    config = json.dumps(demo.get_config_file(), default=str)
+    check("banner is styleable by id", "apache-header" in config,
+          "no elem_id on the header")
+    check("conversation is styleable by id", "apache-chat" in config,
+          "no elem_id on the chatbot")
+
+    check("the stylesheet carries the keyframes", "apache-think" in ui._CSS,
+          "thinking animation missing")
+    check("banner frame is styled", "#apache-header" in ui._CSS,
+          "no banner rules")
+    check("console-style bubbles are styled", "#apache-chat .bubble" in ui._CSS,
+          "no bubble rules")
+    # Gradio 6 ignores Blocks(theme=...); it has to reach launch() to exist.
+    check("theme is applied by the launcher",
+          "theme=_theme()" in Path(ui.__file__).read_text(encoding="utf-8"),
+          "theme not passed to launch()")
+
+    ours = ui._theme()._get_computed_value("primary_500")
+    stock = gr.themes.Base()._get_computed_value("primary_500")
+    check("our hue differs from Gradio's default", ours != stock,
+          f"ours={ours} default={stock}")
+
+
+def test_audio_delivery() -> None:
+    """A reply clip must reach the browser on a machine with no ffmpeg.
+
+    Gradio re-encodes an audio path only when its suffix disagrees with the
+    component's ``format`` (audio.py:320), and that re-encode shells out to
+    ffmpeg through pydub. This machine has no ffmpeg, so a component still
+    claiming ``mp3`` while Piper writes ``.wav`` made every single reply die
+    as a ComponentProcessingError inside on_tick -- Apache looked perfectly
+    healthy and simply never spoke.
+    """
+    get_assistant, _, _, _ = _load_stack()
+    get_assistant()
+
+    import json
+    import wave
+
+    import gradio as gr
+
+    from app import ui
+    from app.voice.tts import clip_extension
+
+    demo = ui.build_demo(get_assistant())
+    claimed = [
+        str((c.get("props") or {}).get("format"))
+        for c in demo.get_config_file().get("components", [])
+        if str(c.get("type", "")).lower() == "audio"
+    ]
+    check("the reply player claims the engine's real format",
+          claimed and claimed[0] == clip_extension().lstrip("."),
+          f"claimed={claimed} engine={clip_extension()}")
+
+    # A minimal but genuinely decodable WAV, so nothing here loads Piper.
+    path = Path(tempfile.gettempdir()) / "apache-delivery.wav"
+    path.unlink(missing_ok=True)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16_000)
+        handle.writeframes(b"\x00\x00" * 1_600)
+    try:
+        matched = gr.Audio(format=clip_extension().lstrip("."), type="filepath")
+        try:
+            served = matched.postprocess(str(path))
+            check("a matching clip is served as-is", served is not None,
+                  repr(served))
+        except Exception as exc:  # noqa: BLE001 - this is the failure
+            check("a matching clip is served as-is", False,
+                  f"{type(exc).__name__}: {exc}")
+
+        # Characterise the bug so the reason the formats must agree is on the
+        # record. Skipped if someone installs ffmpeg, since then it would
+        # succeed by conversion rather than by not converting at all.
+        import gradio.processing_utils as pu
+
+        if not pu.ffmpeg_installed():
+            try:
+                gr.Audio(format="mp3", type="filepath").postprocess(str(path))
+                outcome = "converted"
+            except Exception as exc:  # noqa: BLE001
+                outcome = type(exc).__name__
+            check("a mismatched format is exactly what needs ffmpeg",
+                  outcome != "converted", outcome)
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def test_presence_prompts() -> None:
     """Greeting at startup, a check-in after silence, and no chatter."""
     _g, _b, ui, _ = _load_stack()
@@ -699,6 +806,8 @@ def main() -> int:
         test_audio_queue,
         test_offline_speech,
         test_thinking_animation,
+        test_jarvis_theme,
+        test_audio_delivery,
         test_presence_prompts,
         # Kept last: it resets the shared conversation.
         test_stop_path,
