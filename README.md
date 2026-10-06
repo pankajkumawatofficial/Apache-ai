@@ -27,7 +27,8 @@ Say **"Apache, …"** out loud, or just type. It answers with a voice.
 3. A **tool-calling** model pulled locally. Small, capable choices:
 
    ```bash
-   ollama pull qwen3:8b          # good all-rounder, reliable tool calls
+   ollama pull qwen3:1.7b        # the default: quick enough to feel live
+   ollama pull qwen3:8b          # sturdier tool calls, ~4x slower here
    ollama pull llama3.2:3b       # lighter / faster
    ollama pull gpt-oss:20b       # stronger, needs more RAM
    ```
@@ -104,9 +105,13 @@ Every setting can be overridden with an `APACHE_`-prefixed environment variable
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `APACHE_MODEL` | `qwen3:8b` | Ollama chat model |
+| `APACHE_MODEL` | `qwen3:1.7b` | Ollama chat model |
 | `APACHE_EMBEDDING_MODEL` | `nomic-embed-text` | RAG embedding model |
 | `APACHE_OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint |
+| `APACHE_OLLAMA_KEEP_ALIVE` | `-1` | How long Ollama keeps the model resident; `-1` is forever |
+| `APACHE_GREETING` | `Hello boss! What we will do today.` | Spoken once when the app starts |
+| `APACHE_IDLE_PROMPT_S` | `60` | Seconds of silence before a check-in; `0` disables it |
+| `APACHE_IDLE_PROMPT` | `Sir! Are you here?` | What Apache says when you have been quiet |
 | `APACHE_TEMPERATURE` | `0.2` | Sampling temperature |
 | `APACHE_NUM_CTX` | `8192` | Context window passed to Ollama |
 | `APACHE_WAKE_WORD` | `apache` | Word that activates the microphone |
@@ -255,7 +260,7 @@ otherwise.
 
 ## Example session
 
-Verified end-to-end on this machine — `qwen3:8b` on a CPU-only laptop
+Verified end-to-end on this machine — `qwen3:1.7b` on a CPU-only laptop
 (i5-1235U, Intel UHD, 16 GB RAM):
 
 ```
@@ -312,10 +317,20 @@ refused rather than queued. Press **Stop** first if you want to change course.
 ### It is only as fast as your hardware
 
 Apache does no inference of its own — Ollama does, and Ollama reports
-`PROCESSOR: 100% CPU` on a machine without a supported GPU. On the machine this
-was developed on, a single tool-calling turn against `qwen3:8b` takes **~3
-minutes**; a plain reply is faster but still tens of seconds, and the first turn
-after a pull pays for loading 6.7 GB into memory.
+`PROCESSOR: 100% CPU` on a machine without a supported GPU. Measured on the
+machine this was developed on (i5-1235U), wall clock from submitting a request
+to a complete answer:
+
+| Turn | `qwen3:1.7b` (default) | `qwen3:8b` |
+|---|---|---|
+| Plain question, no tools | 1.4 s | 2.4 s |
+| One tool call | 7.5 s | 29.1 s |
+| First turn after a pull | +1.4 GB load | +6.7 GB load |
+
+The first turn after `ollama pull` is slower than the rest because the weights
+are still on disk. `APACHE_OLLAMA_KEEP_ALIVE=-1` stops Ollama unloading the
+model between turns: reloading costs about 25 s, which is far worse than
+holding 1.4 GB in memory.
 
 That is the model, not the app: token streaming, the activity panel and the
 voice path all work normally, you just wait longer for tokens.
@@ -324,9 +339,9 @@ If that is too slow, the lever is the model, not the configuration:
 
 | Model | Size | On this hardware |
 |---|---|---|
-| `qwen3:8b` | 5.2 GB | default; ~3 min / tool turn |
-| `qwen3:4b` | 2.6 GB | noticeably quicker, still reliable at tool calls |
-| `qwen3:1.7b` | 1.4 GB | fast, but will occasionally skip tools |
+| `qwen3:1.7b` | 1.4 GB | default; ~7 s / tool turn |
+| `qwen3:4b` | 2.6 GB | quicker than 8b, still reliable at tool calls |
+| `qwen3:8b` | 5.2 GB | sturdiest tool calls; ~29 s / tool turn |
 
 Set `APACHE_MODEL` or pick a different model in the **Model** tab — no restart
 required. A machine with an NVIDIA GPU lands in a different category entirely.
@@ -361,7 +376,7 @@ its own system applications — use the Windows Security toggle instead.
 |---|---|
 | `Cannot reach Ollama` | Start it: `ollama serve` (or launch the Ollama app) |
 | `model '…' not found` | `ollama pull <model>` |
-| Tools never fire | Use a tool-calling model; try `qwen3:8b` |
+| Tools never fire | Use a tool-calling model; `qwen3:8b` never skips them, the default `qwen3:1.7b` occasionally does |
 | Documents answer weakly | `ollama pull nomic-embed-text`, then re-upload |
 | No wake word response | Check the **Voice** panel state; the mic may be muted, stopped, or have hit repeated STT failures |
 | `Speech recognition failed` repeatedly | The listener stops after 5 consecutive failures to avoid spinning; restart it with the mic button |

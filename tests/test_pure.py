@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import settings                                        # noqa: E402
+from app.text import plain_math                                        # noqa: E402
 from app.tools.calculator import CalcError, safe_eval          # noqa: E402
 from app.tools.files import (                                  # noqa: E402
     FileAccessError,
@@ -190,6 +191,42 @@ def test_speech_cleanup() -> None:
     check("caps long reply", len(speakable_text(long_reply)) < 1_800)
     check("estimate sane", 0 < estimate_duration_s("hello there") < 5)
     check("estimate empty", estimate_duration_s("") == 0.0)
+
+
+def test_plain_math() -> None:
+    print("math markup becomes words")
+    # Verbatim from qwen3:1.7b for "What is 1739 * 42?", which the system
+    # prompt had already forbidden. The synthesiser would have read that as
+    # dollar signs and a backslash.
+    raw = "The result of $1739 \\times 42$ is $73038$."
+    seen = plain_math(raw)
+    check("formula reads as words",
+          seen == "The result of 1739 times 42 is 73038.", repr(seen))
+    check("no delimiter reaches the speaker", "$" not in seen, repr(seen))
+    check("no backslash reaches the speaker", "\\" not in seen, repr(seen))
+
+    check("plain prose is untouched",
+          plain_math("The capital of France is Paris.")
+          == "The capital of France is Paris.")
+    check("a lone price keeps its sign",
+          plain_math("It costs $5.") == "It costs $5.")
+    check("two prices keep their signs",
+          plain_math("It costs $5 and $10.") == "It costs $5 and $10.")
+    check("a named operator is spoken",
+          plain_math(r"$a \div b$") == "a divided by b")
+    check("a fraction reads across", plain_math(r"$\frac{1}{2}$") == "1 over 2")
+    check("a root reads aloud", plain_math(r"$\sqrt{9}$") == "square root of 9")
+    check("a power reads aloud",
+          plain_math(r"$2^{10}$") == "2 to the power 10")
+
+    fenced = "```python\nprint('a\\tb')\n```"
+    check("fenced code keeps its escapes",
+          plain_math(fenced) == fenced, repr(plain_math(fenced)))
+
+    mixed = r"Use `\t` for a tab, and $a^2$ for the square."
+    got = plain_math(mixed)
+    check("code escapes survive a prose rewrite",
+          "`\\t`" in got and "$" not in got, repr(got))
 
 
 # --------------------------------------------------------------------------
@@ -413,6 +450,7 @@ def main() -> int:
         test_files,
         test_wake_word,
         test_speech_cleanup,
+        test_plain_math,
         test_vad,
         test_gate_multiplier,
         test_sandbox,

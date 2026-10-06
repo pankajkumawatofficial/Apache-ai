@@ -14,6 +14,7 @@ copy of the conversation to keep in sync.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Iterator
 
 import gradio as gr
@@ -169,6 +170,52 @@ def _render(snapshot: Snapshot) -> tuple[Any, Any, Any, Any]:
     return messages, activity, audio, status
 
 
+#: Spinner frames for a bubble the model has not answered yet. The frame is
+#: derived from wall time, so the ticker needs no state of its own and two
+#: viewers of the same page still see the same animation.
+_THINKING_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+#: Applied to the pending bubble. Kept gentle: this is a status cue, not a
+#: distraction, and it must stay readable in a dark terminal-style theme.
+_CSS = """
+.apache-thinking {
+    display: inline-block;
+    animation: apache-think 1.15s ease-in-out infinite;
+}
+@keyframes apache-think {
+    0%, 100% { opacity: .30; letter-spacing: .02em; }
+    50%      { opacity: 1;   letter-spacing: .12em; }
+}
+"""
+
+
+def _thinking_html() -> str:
+    frame = _THINKING_FRAMES[int(time.time() * 1.7) % len(_THINKING_FRAMES)]
+    # The span carries the CSS animation. If a stricter sanitisation policy
+    # ever strips the tag, the spinner and the word still render, so the
+    # bubble is never left blank.
+    return f'<span class="apache-thinking">{frame} Thinking…</span>'
+
+
+def _with_thinking(
+    messages: list[dict[str, str]], busy: bool
+) -> list[dict[str, str]]:
+    """Animate a bubble that exists but has no text yet.
+
+    Only the empty placeholder that :meth:`Assistant._begin_turn` creates
+    qualifies -- once the first token arrives the real text replaces it, so
+    the animation cannot overwrite an answer in progress.
+    """
+    if not busy or not messages:
+        return messages
+    last = messages[-1]
+    if last.get("role") != "assistant" or (last.get("content") or "").strip():
+        return messages
+    out = [dict(m) for m in messages]
+    out[-1] = {**last, "content": _thinking_html()}
+    return out
+
+
 def _device_choices() -> tuple[list[str], str]:
     """Microphone picker entries, with the system default listed and selected.
 
@@ -207,6 +254,7 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
         seconds + assistant.settings.playback_mute_s
     )
 
+    # Gradio 6 takes css on launch(), not on the constructor.
     with gr.Blocks(title="Apache", fill_height=True) as demo:
         gr.Markdown(_HEADER)
 
@@ -361,6 +409,9 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
 
         def on_tick(last_audio: Any) -> tuple:
             messages, act, audio, stat = _render(assistant.snapshot())
+            # The timer is the only thing running while the model is silent,
+            # so it is what drives the animation in a pending bubble.
+            messages = _with_thinking(messages, assistant.busy)
             audio_out = audio if audio != last_audio else gr.skip()
             busy = assistant.busy
             return (
@@ -382,6 +433,8 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
             return messages, gr.skip(), stat
 
         def on_mic(device_value: str | None) -> tuple:
+            # Reaching for the microphone is the user being present.
+            assistant.note_input()
             if listener.running:
                 listener.stop()
             else:
@@ -514,11 +567,15 @@ def build_and_launch(
     share: bool = False,
 ) -> None:
     demo = build_demo(assistant)
+    # Only the real launcher speaks. Tests build demos too, and must not open
+    # a network TTS call or leave a thread running behind them.
+    (assistant or get_assistant()).start_prompts()
     demo.launch(
         server_name=server_name,
         server_port=server_port,
         inbrowser=inbrowser,
         share=share,
         show_error=True,
+        css=_CSS,
         allowed_paths=[str(assistant.workspace) if assistant else "."],
     )

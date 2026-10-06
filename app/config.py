@@ -82,9 +82,18 @@ Tool guidance:
 @dataclass
 class Settings:
     # --- model -----------------------------------------------------------
-    model: str = _env("MODEL", "qwen3:8b")
+    # qwen3:1.7b rather than 8b: this machine has no GPU runtime installed
+    # (Ollama reports 100% CPU) where decode measured ~2.3 tok/s, so an 8b
+    # tool turn took 29 s. The 1.7b model is roughly four times quicker and
+    # still handles the tool loop; the model dropdown offers 8b back with one
+    # click whenever answers matter more than latency.
+    model: str = _env("MODEL", "qwen3:1.7b")
     embedding_model: str = _env("EMBEDDING_MODEL", "nomic-embed-text")
     ollama_base_url: str = _env("OLLAMA_BASE_URL", "http://localhost:11434")
+    # Ollama unloads a model after keep_alive and reloads it on the next
+    # request. Reloading measured 25 s of pure stall. "-1" keeps the weights
+    # resident until Ollama itself is restarted.
+    ollama_keep_alive: str = _env("OLLAMA_KEEP_ALIVE", "-1")
     temperature: float = _env_float("TEMPERATURE", 0.2)
     request_timeout: int = _env_int("REQUEST_TIMEOUT", 180)
     recursion_limit: int = _env_int("RECURSION_LIMIT", 24)
@@ -136,6 +145,15 @@ class Settings:
     tts_rate: str = _env("TTS_RATE", "+0%")
     # Mute the mic while we are talking so the assistant does not hear itself.
     playback_mute_s: float = _env_float("PLAYBACK_MUTE_S", 2.0)
+
+    # --- presence ---------------------------------------------------------
+    # Spoken once when Apache comes up, before anyone has asked anything.
+    greeting: str = _env("GREETING", "Hello boss! What we will do today.")
+    # Spoken when this many seconds pass with no input at all. The clock
+    # restarts on any interaction and is held back while a reply is in
+    # flight, so Apache never talks over its own answer. 0 disables it.
+    idle_prompt_s: int = _env_int("IDLE_PROMPT_S", 60)
+    idle_prompt: str = _env("IDLE_PROMPT", "Sir! Are you here?")
 
     # --- agent / tools ---------------------------------------------------
     sandbox_timeout_s: int = _env_int("SANDBOX_TIMEOUT", 20)

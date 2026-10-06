@@ -394,6 +394,147 @@ def test_capture_feeds_vad() -> None:
           f"level={listener.status()['level']}")
 
 
+def test_thinking_animation() -> None:
+    """A bubble the model has not answered yet must visibly move."""
+    _g, _b, ui, _ = _load_stack()
+    get_assistant, _, _, _ = _load_stack()
+    assistant = get_assistant()
+
+    pending = [{"role": "assistant", "content": ""}]
+    answered = [{"role": "assistant", "content": "Paris."}]
+
+    shown = ui._with_thinking(pending, True)
+    check("pending bubble is animated",
+          "apache-thinking" in shown[0]["content"], repr(shown[0]["content"]))
+    check("the shared history is not mutated",
+          pending[0]["content"] == "", repr(pending[0]["content"]))
+    check("an answered bubble is left alone",
+          ui._with_thinking(answered, True) == answered)
+    check("nothing animates while idle",
+          ui._with_thinking(pending, False) == pending)
+    check("an empty transcript is left alone",
+          ui._with_thinking([], True) == [])
+
+    first = ui._with_thinking(pending, True)[0]["content"]
+    time.sleep(0.75)  # longer than one frame at 1.7 frames a second
+    second = ui._with_thinking(pending, True)[0]["content"]
+    check("the frame advances over time", first != second,
+          f"{first!r} vs {second!r}")
+    check("the stylesheet carries the keyframes", "apache-think" in ui._CSS)
+
+    # Defining the helper is not enough: the ticker has to apply it, or the
+    # bubble stays blank no matter what _with_thinking does.
+    demo = ui.build_demo(assistant)
+    fns = getattr(demo, "fns", None)
+    by_name = {}
+    for entry in (fns.values() if isinstance(fns, dict) else fns or []):
+        fn = getattr(entry, "fn", None)
+        if fn is not None:
+            by_name[getattr(fn, "__name__", "?")] = fn
+    check("ticker handler is registered", "on_tick" in by_name,
+          sorted(by_name)[:8])
+
+    saved = list(assistant._history)
+    with assistant._lock:
+        assistant._history = [{"role": "assistant", "content": ""}]
+        assistant._busy = True
+    try:
+        rendered = by_name["on_tick"](None)[0]
+        last = rendered[-1] if rendered else {}
+        check("on_tick animates the pending bubble",
+              "apache-thinking" in str(last.get("content", "")),
+              str(last)[:110])
+    finally:
+        with assistant._lock:
+            assistant._busy = False
+            assistant._history = saved
+
+
+def test_presence_prompts() -> None:
+    """Greeting at startup, a check-in after silence, and no chatter."""
+    _g, _b, ui, _ = _load_stack()
+    get_assistant, _, _, _ = _load_stack()
+    assistant = get_assistant()
+
+    spoken: list[str] = []
+    original_synth = assistant._synthesize
+    saved_period = assistant.settings.idle_prompt_s
+    saved_speak = assistant.speak_replies
+    # Swap synthesis out so neither test opens a network TTS call.
+    assistant._synthesize = lambda text: spoken.append(text)
+    assistant.speak_replies = True
+    assistant.stop_prompts()
+    assistant._prompts_started = False
+
+    try:
+        assistant.settings.idle_prompt_s = 1  # keep the wait short
+        assistant.start_prompts()
+
+        deadline = time.time() + 4.0
+        while time.time() < deadline and not spoken:
+            time.sleep(0.05)
+        check("greets on startup", assistant.settings.greeting in spoken,
+              repr(spoken))
+
+        assistant.start_prompts()
+        time.sleep(0.4)
+        check("the greeting is not repeated",
+              spoken.count(assistant.settings.greeting) == 1, repr(spoken))
+
+        deadline = time.time() + 6.0
+        idle = assistant.settings.idle_prompt
+        while time.time() < deadline and idle not in spoken:
+            time.sleep(0.05)
+        check("checks in once the idle window passes", idle in spoken,
+              repr(spoken))
+
+        before = assistant._last_input
+        assistant.note_input()
+        check("any interaction restarts the idle clock",
+              assistant._last_input >= before,
+              f"{assistant._last_input:.3f} vs {before:.3f}")
+
+        # Never talk over a reply in flight.
+        with assistant._lock:
+            assistant._busy = True
+            assistant._last_input = time.monotonic() - 99
+        spoken.clear()
+        time.sleep(2.5)
+        check("stays quiet while a reply is in flight", not spoken,
+              repr(spoken))
+        with assistant._lock:
+            assistant._busy = False
+
+        # Stop the idle thread before the remaining, timing-free checks.
+        assistant.stop_prompts()
+        time.sleep(1.0)
+
+        spoken.clear()
+        assistant.speak_replies = False
+        assistant.say("must not be spoken")
+        time.sleep(0.4)
+        check("honours the speak-replies switch", not spoken, repr(spoken))
+
+        assistant.speak_replies = True
+        spoken.clear()
+        assistant.say("   ")
+        time.sleep(0.4)
+        check("blank announcements are ignored", not spoken, repr(spoken))
+
+        check("greeting is configurable", bool(assistant.settings.greeting),
+              repr(assistant.settings.greeting))
+        check("check-in line is configurable", bool(idle), repr(idle))
+    finally:
+        assistant._synthesize = original_synth
+        assistant.settings.idle_prompt_s = saved_period
+        assistant.speak_replies = saved_speak
+        assistant.stop_prompts()
+        assistant._prompts_started = False
+        with assistant._lock:
+            assistant._busy = False
+            assistant._last_input = time.monotonic()
+
+
 def main() -> int:
     print("Apache stack tests")
     print("-" * 64)
@@ -417,6 +558,8 @@ def main() -> int:
         test_agent_turn_degrades_cleanly,
         test_listener_diagnostics,
         test_capture_feeds_vad,
+        test_thinking_animation,
+        test_presence_prompts,
         # Kept last: it resets the shared conversation.
         test_stop_path,
     ):

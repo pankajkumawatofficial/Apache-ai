@@ -23,6 +23,7 @@ from typing import Any
 from .agent import AgentEvent, AgentRunner
 from .config import AUDIO, WORKSPACE, Settings, settings as default_settings
 from .rag import DocumentStore
+from .text import plain_math
 
 __all__ = ["Assistant", "Snapshot", "VoicePrompt"]
 
@@ -72,6 +73,13 @@ class Assistant:
         #: so the listener can mute and stop hearing itself talk.
         self.on_reply_audio: Callable[[str, float], None] | None = None
 
+        # Presence. _last_input is the clock the idle check-in watches; every
+        # interaction restarts it. Read and written under the same lock as the
+        # rest of the state so a reply in flight can never be talked over.
+        self._last_input = time.monotonic()
+        self._prompts_started = False
+        self._stop_prompts = threading.Event()
+
     # ------------------------------------------------------------------
     # Reads
     # ------------------------------------------------------------------
@@ -100,6 +108,7 @@ class Assistant:
         turn notices at its next yield, tears down cleanly and releases the
         busy flag, so the UI becomes usable again immediately.
         """
+        self.note_input()
         with self._lock:
             if not self._busy:
                 return False
@@ -117,6 +126,7 @@ class Assistant:
     # ------------------------------------------------------------------
     def reset(self) -> Snapshot:
         """Start a fresh conversation, leaving the document index alone."""
+        self.note_input()
         with self._lock:
             self._history = welcome_history()
             self._activity.clear()
@@ -136,6 +146,7 @@ class Assistant:
         voice: str | None = None,
         reasoning: bool | None = None,
     ) -> Snapshot:
+        self.note_input()
         with self._lock:
             if model:
                 self.model = model
@@ -154,6 +165,7 @@ class Assistant:
 
     def ingest(self, paths: Iterable[str | Path]) -> Snapshot:
         """Index uploaded documents. Safe to call while idle."""
+        self.note_input()
         materialised = [p for p in (paths or []) if p]
         with self._lock:
             self._status = f"Indexing {len(materialised)} file(s)..."
@@ -164,11 +176,81 @@ class Assistant:
         return self.snapshot()
 
     def clear_documents(self) -> Snapshot:
+        self.note_input()
         summary = self.store.clear()
         self.log(summary)
         with self._lock:
             self._status = summary
         return self.snapshot()
+
+    # ------------------------------------------------------------------
+    # Presence: startup greeting and idle check-in
+    # ------------------------------------------------------------------
+    def note_input(self) -> None:
+        """Record that the user did something, restarting the idle clock."""
+        with self._lock:
+            self._last_input = time.monotonic()
+
+    def say(self, text: str) -> None:
+        """Speak *text* without joining the conversation.
+
+        An announcement is not a turn: it must not touch the transcript, must
+        not claim the busy flag, and must never delay whatever the caller was
+        doing. Speech is synthesised on its own thread and reaches the browser
+        through the timer that already watches for the audio path changing.
+        """
+        text = (text or "").strip()
+        if not text or not self.speak_replies:
+            return
+        threading.Thread(
+            target=self._synthesize,
+            args=(text,),
+            name="apache-announce",
+            daemon=True,
+        ).start()
+
+    def start_prompts(self) -> None:
+        """Greet on startup, then check in whenever input goes quiet.
+
+        Called once by the launcher. Tests deliberately do not call it: they
+        would otherwise open a network TTS request and leave a thread running
+        after the suite had finished.
+        """
+        with self._lock:
+            if self._prompts_started:
+                return
+            self._prompts_started = True
+            self._last_input = time.monotonic()
+        self._stop_prompts.clear()
+        self.say(self.settings.greeting)
+
+        period = self.settings.idle_prompt_s
+        if period > 0:
+            threading.Thread(
+                target=self._idle_loop,
+                args=(float(period),),
+                name="apache-idle",
+                daemon=True,
+            ).start()
+
+    def stop_prompts(self) -> None:
+        """Halt the greeting and idle threads (shutdown and tests)."""
+        self._stop_prompts.set()
+
+    def _idle_loop(self, period: float) -> None:
+        """Say the check-in line every *period* seconds of genuine silence."""
+        while not self._stop_prompts.wait(1.0):
+            with self._lock:
+                if self._busy:
+                    # Answering is not the user going away. Holding the clock
+                    # here is what stops Apache talking over its own reply.
+                    self._last_input = time.monotonic()
+                    continue
+                if time.monotonic() - self._last_input < period:
+                    continue
+                # Re-arm before speaking, so a TTS failure cannot spin.
+                self._last_input = time.monotonic()
+            self.say(self.settings.idle_prompt)
 
     # ------------------------------------------------------------------
     # Turns
@@ -184,6 +266,8 @@ class Assistant:
             yield self.snapshot()
             return
 
+        # Anything typed or spoken is the user being present.
+        self.note_input()
         claimed = self._begin_turn(text)
         if not claimed:
             yield self.snapshot()
@@ -282,10 +366,12 @@ class Assistant:
             return False
 
     def _set_reply(self, text: str) -> None:
+        # Sanitised here so the transcript and the synthesiser see one text.
+        clean = plain_math(text)
         if len(self._history) >= 2 and self._history[-1]["role"] == "assistant":
-            self._history[-1]["content"] = text
+            self._history[-1]["content"] = clean
         else:  # pragma: no cover - _begin_turn always leaves a placeholder
-            self._history.append({"role": "assistant", "content": text})
+            self._history.append({"role": "assistant", "content": clean})
 
     def _finish_turn(self) -> None:
         reply = ""

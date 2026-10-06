@@ -53,6 +53,21 @@ def check_ollama(base_url: str | None = None, timeout: float = 3.0) -> OllamaSta
     return OllamaStatus(True, models, f"{len(models)} model(s) available")
 
 
+def _keep_alive(value: object) -> int | str:
+    """Normalise ``keep_alive`` for Ollama's API.
+
+    Ollama takes either an integer number of seconds or a duration carrying a
+    unit (``"30m"``). The string ``"-1"`` is read as a duration and rejected
+    with *"missing unit in duration"*, which fails every turn -- so a bare
+    number has to arrive as a number. ``-1`` means never unload.
+    """
+    text = str(value).strip()
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
 def build_chat_model(
     model: str | None = None,
     temperature: float | None = None,
@@ -67,6 +82,9 @@ def build_chat_model(
         base_url=(base_url or settings.ollama_base_url).rstrip("/"),
         temperature=settings.temperature if temperature is None else temperature,
         num_ctx=settings.num_ctx,
+        # Keep the weights resident. Ollama unloads after keep_alive (5 min by
+        # default) and reloading measured 25 s of a turn spent on nothing else.
+        keep_alive=_keep_alive(settings.ollama_keep_alive),
         # Left as None, Ollama applies the model's own default -- which for
         # qwen3 is thinking ON, ~16x slower on CPU. Apache passes an explicit
         # False unless the operator opted in with APACHE_REASONING=1.
