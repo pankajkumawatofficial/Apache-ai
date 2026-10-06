@@ -70,6 +70,24 @@ def _level_meter(level: float, threshold: float, width: int = 18) -> str:
     return f"`{bar}` {level:.4f} / {threshold:.4f} ({verdict})"
 
 
+def _voice_choices(assistant: Assistant) -> tuple[list[str], str]:
+    """Choices and default for the Voice dropdown, in the engine's own terms.
+
+    Offline the dropdown listed edge-tts names that the engine then ignored,
+    so "try a different voice" was a control that did nothing at all. What is
+    downloaded now leads, because those are the only voices Piper can speak
+    with; the online names follow, since the same field drives
+    ``APACHE_OFFLINE=0``.
+    """
+    from .voice import tts
+
+    local = tts.available_voices()
+    if settings.offline and local:
+        current = tts.resolve_model(assistant.voice).stem
+        return local, current if current in local else local[0]
+    return list(TTS_VOICES), assistant.voice
+
+
 def _voice_status_text(listener: WakeListener) -> str:
     info = listener.status()
     state = info["state"]
@@ -86,6 +104,11 @@ def _voice_status_text(listener: WakeListener) -> str:
         lines.append(f"\n_Last heard:_ `{info['transcript']}`")
     lines.append(
         f"\nWake word: **{info['wake_word']}**"
+        + (
+            " — _optional, any question works_"
+            if not info.get("wake_required", True)
+            else ""
+        )
         + (" · _muted while speaking_" if info["muted"] else "")
     )
 
@@ -480,6 +503,157 @@ def _theme():
     )
 
 
+def _keepalive_wav() -> str:
+    """A data URI for 0.2 s of near-silent tone.
+
+    Chrome treats a page that is playing audio as foreground: it stops
+    clamping that page's timers, and stops dropping them to one a minute
+    after five minutes in the background. Without this, Apache answering into
+    a tab you are no longer looking at is delivered up to a minute late.
+
+    The tone is 44 dB below full scale -- non-zero, so it counts as audio,
+    and far too quiet to be heard. 0.2 s is exactly twenty cycles at 100 Hz,
+    so the loop rejoins in phase and does not click.
+    """
+    import base64
+    import io
+    import math
+    import struct
+    import wave as wave_module
+
+    rate, seconds, hz, amplitude = 8000, 0.2, 100, 20
+    frames = int(rate * seconds)
+    payload = b"".join(
+        struct.pack(
+            "<h",
+            int(amplitude * math.sin(2 * math.pi * hz * i / rate)),
+        )
+        for i in range(frames)
+    )
+    buffer = io.BytesIO()
+    with wave_module.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(payload)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:audio/wav;base64,{encoded}"
+
+
+def _page_js() -> str:
+    """Everything about speaking that has to happen in the browser.
+
+    Three independent reasons a reply can synthesise perfectly and still come
+    out of the speaker as nothing, none of which are visible from Python:
+
+    1. **Gradio stops ticking when the tab is hidden.** Its Timer reads
+       ``document.visibilityState === "visible"`` on every tick and dispatches
+       nothing otherwise -- so the moment another tab is in front, the audio
+       queue is never drained and the transcript never updates, however
+       healthy Apache is. The guard reads the property each time, so
+       shadowing it on this document keeps the ticks coming.
+    2. **Chrome throttles hidden tabs' timers**, to once a second and then,
+       after five minutes, to once a minute -- exempting pages that are
+       playing audio. The keep-alive loop buys that exemption.
+    3. **Chrome blocks media that starts without a user gesture**, and
+       Apache's first words are the greeting, spoken before anyone has
+       clicked anything, because the whole point is that you talk to it. One
+       inaudible buffer on the first interaction unlocks the origin; replies
+       the browser rejected are retried on every tick.
+    """
+    wav = _keepalive_wav()
+    return """
+(function () {
+  "use strict";
+
+  var keepAliveWav = "%s";
+
+  /* --- 1. Keep the ticker running while another tab is in front --------- */
+  try {
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: function () { return "visible"; }
+    });
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      get: function () { return false; }
+    });
+  } catch (err) {
+    /* Non-configurable engine: falls back to ticking only while visible,
+       which is exactly the behaviour being fixed, not a new failure. */
+  }
+
+  /* --- 2. Stay exempt from Chrome's background-timer throttling --------- */
+  var keepAlive = null;
+  function ensureKeepAlive() {
+    try {
+      if (!keepAlive) {
+        keepAlive = document.createElement("audio");
+        keepAlive.loop = true;
+        keepAlive.preload = "auto";
+        keepAlive.setAttribute("aria-hidden", "true");
+        keepAlive.src = keepAliveWav;
+        document.body.appendChild(keepAlive);
+      }
+      if (keepAlive.paused) {
+        var attempt = keepAlive.play();
+        if (attempt && attempt.catch) {
+          attempt.catch(function () { /* allowed on a later tick */ });
+        }
+      }
+    } catch (err) {
+      keepAlive = null;
+    }
+  }
+
+  /* --- 3. Unlock autoplay, and retry a reply it rejected ---------------- */
+  function retryBlockedReplies() {
+    try {
+      var players = document.getElementsByTagName("audio");
+      for (var i = 0; i < players.length; i++) {
+        var el = players[i];
+        if (el === keepAlive || !el.paused || el.ended) continue;
+        if (!el.currentSrc) continue;
+        // Only a clip that has not started: one already played, or finished,
+        // must never be restarted by this watchdog.
+        if (el.currentTime > 0.05) continue;
+        var attempt = el.play();
+        if (attempt && attempt.catch) { attempt.catch(function () {}); }
+      }
+    } catch (err) { /* the DOM changed under us; next tick retries */ }
+  }
+
+  var unlocked = false;
+  function unlock() {
+    if (unlocked) return;
+    unlocked = true;
+    try {
+      var Context = window.AudioContext || window.webkitAudioContext;
+      var ctx = new Context();
+      var buffer = ctx.createBuffer(1, 1, 22050);
+      var source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.start(0);
+      if (ctx.state === "suspended" && ctx.resume) ctx.resume();
+      window.apacheAudioContext = ctx;
+    } catch (err) { /* the next gesture tries again */ }
+    ensureKeepAlive();
+    retryBlockedReplies();
+  }
+  ["pointerdown", "keydown", "touchstart"].forEach(function (name) {
+    document.addEventListener(name, unlock, true);
+  });
+
+  ensureKeepAlive();
+  setInterval(function () {
+    ensureKeepAlive();
+    retryBlockedReplies();
+  }, 1000);
+})();
+""" % wav
+
+
 def _thinking_html() -> str:
     frame = _THINKING_FRAMES[int(time.time() * 1.7) % len(_THINKING_FRAMES)]
     # The span carries the CSS animation. If a stricter sanitisation policy
@@ -621,6 +795,8 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
                 mic_button = gr.Button("Start listening", variant="primary")
                 voice_status = gr.Markdown(_voice_status_text(listener))
 
+                voice_choices, voice_value = _voice_choices(assistant)
+
                 with gr.Tabs():
                     with gr.Tab("Documents"):
                         files = gr.UploadButton(
@@ -639,8 +815,8 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
                             label="Speak replies aloud",
                         )
                         voice = gr.Dropdown(
-                            choices=TTS_VOICES,
-                            value=assistant.voice,
+                            choices=voice_choices,
+                            value=voice_value,
                             label="Voice",
                             allow_custom_value=True,
                         )
@@ -648,6 +824,16 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
                             value=assistant.settings.wake_word,
                             label="Wake word",
                             info="Say this first to ask a question out loud.",
+                        )
+                        wake_required = gr.Checkbox(
+                            value=assistant.settings.wake_required,
+                            label="Require the wake word",
+                            info=(
+                                "Off: answer anything you say, no “Apache” "
+                                "needed. On: only run what follows the wake "
+                                "word, which keeps a television from talking "
+                                "to you."
+                            ),
                         )
 
                     with gr.Tab("Model"):
@@ -762,6 +948,7 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
             speak_value: bool,
             voice_value: str,
             wake_value: str,
+            wake_required_value: bool,
             reasoning_value: bool,
         ) -> tuple:
             word = (wake_value or "").strip().lower() or settings.wake_word
@@ -769,6 +956,10 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
             settings.wake_aliases = [word] + [
                 alias for alias in DEFAULT_WAKE_ALIASES if alias != word
             ]
+            # The listener reads this off the shared settings on every
+            # utterance, so no restart and no button press is needed to stop
+            # asking to be addressed by name.
+            settings.wake_required = bool(wake_required_value)
             snapshot = assistant.configure(
                 model=(model_value or "").strip() or assistant.model,
                 temperature=temperature_value,
@@ -840,7 +1031,10 @@ def build_demo(assistant: Assistant | None = None) -> gr.Blocks:
                          outputs=[chatbot, activity, voice_audio, status, voice_status])
         apply.click(
             on_apply,
-            inputs=[model, temperature, system_prompt, speak, voice, wake, reasoning],
+            inputs=[
+                model, temperature, system_prompt, speak, voice, wake,
+                wake_required, reasoning,
+            ],
             outputs=[chatbot, activity, voice_audio, status, settings_status],
         )
         demo.load(
@@ -893,5 +1087,6 @@ def build_and_launch(
         show_error=True,
         theme=_theme(),
         css=_CSS,
+        js=_page_js(),
         allowed_paths=[str(assistant.workspace) if assistant else "."],
     )

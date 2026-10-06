@@ -32,7 +32,7 @@ from typing import Any
 
 from ..config import Settings, settings as default_settings
 from .vad import EnergyVAD
-from .wake import match_wake
+from .wake import resolve_command
 
 __all__ = ["WakeListener", "WAKE_ONLY_PROMPT", "list_input_devices"]
 
@@ -148,6 +148,7 @@ class WakeListener:
                 "device_index": self._device_index,
                 "muted": time.time() < self._muted_until,
                 "wake_word": self.settings.wake_word,
+                "wake_required": self.settings.wake_required,
                 # Capture health.
                 "level": self._level,
                 "threshold": self._vad.threshold if self._vad is not None else 0.0,
@@ -232,7 +233,11 @@ class WakeListener:
             self._state = "listening"
             self._message = (
                 f"Listening on {device_name} @ {rate} Hz. "
-                f'Say "{self.settings.wake_word}" to ask something.'
+                + (
+                    f'Say "{self.settings.wake_word}" to ask something.'
+                    if self.settings.wake_required
+                    else "Just ask — no wake word needed."
+                )
             )
 
         self._capture_thread = threading.Thread(
@@ -438,10 +443,14 @@ class WakeListener:
                 return
             self._transcript = transcript
 
-        matched, command = match_wake(transcript, self.settings.wake_aliases)
+        # One decision, one place: the wake word is a gate when it is asked
+        # for and a convenience when it is not.
+        act, command = resolve_command(
+            transcript, self.settings.wake_aliases, self.settings.wake_required
+        )
 
         with self._lock:
-            if not matched:
+            if not act:
                 self._state = "listening"
                 self._message = f'Heard "{transcript}" (no wake word).'
                 return
@@ -463,10 +472,15 @@ class WakeListener:
             if not self._running:
                 return
             self._state = "listening"
-            self._message = (
-                f'Heard "{transcript}". '
-                f'Say "{self.settings.wake_word}" again for the next question.'
-            )
+            # Both modes have to say what happens next, or the mic appears to
+            # have gone deaf after answering one question.
+            if self.settings.wake_required:
+                self._message = (
+                    f'Heard "{transcript}". '
+                    f'Say "{self.settings.wake_word}" again for the next question.'
+                )
+            else:
+                self._message = f'Heard "{transcript}". Ready for the next one.'
 
     def _stt_failure(self, message: str) -> None:
         """Report a recogniser failure, and give up if they never stop.

@@ -301,7 +301,8 @@ class Assistant:
                     yield self.snapshot()
 
             if stopped:
-                # Do not synthesise speech for a reply the user abandoned.
+                # The abandoned reply itself is never spoken; the stop is
+                # confirmed out loud so an interrupted turn is not silent.
                 self._abort_turn("Stopped.")
                 yield self.snapshot()
             else:
@@ -384,17 +385,20 @@ class Assistant:
 
     def _finish_turn(self) -> None:
         reply = ""
-        errored = False
         with self._lock:
             if self._history and self._history[-1]["role"] == "assistant":
                 reply = self._history[-1]["content"]
-            errored = reply.startswith("⚠")
             if not reply:
                 self._history[-1]["content"] = "(no reply)"
             if self._status in ("Thinking...", "Answered.") or self._status.startswith("Using"):
                 self._status = "Ready."
 
-        if not self.speak_replies or errored or not reply.strip():
+        # Every reply is spoken, errors included. A failure that is only
+        # written down looks identical, from the user's side of the screen,
+        # to Apache deciding not to talk -- and that is the one thing they
+        # cannot diagnose. The warning sign is stripped by the synthesiser
+        # rather than read aloud as nothing.
+        if not self.speak_replies or not reply.strip():
             return
         self._synthesize(reply)
 
@@ -404,6 +408,10 @@ class Assistant:
                 if not self._history[-1]["content"]:
                     self._history[-1]["content"] = f"⚠ {message}"
             self._status = message
+        # An interrupted turn used to end in silence, which is the least
+        # helpful possible outcome: nothing on screen, nothing to hear.
+        if message:
+            self.say(message)
 
     def _release(self) -> None:
         with self._lock:
@@ -472,9 +480,22 @@ class Assistant:
             return len(self._audio_queue)
 
     def _prune_audio(self) -> None:
+        """Delete old clips, never one still owed to the browser.
+
+        The queue and the clip currently playing are exactly the files that
+        must survive: trimming one of those is a reply that was written,
+        queued, and then quietly made inaudible -- indistinguishable from
+        Apache failing to speak.
+        """
         try:
+            with self._lock:
+                live = {path for path, _ in self._audio_queue}
+                if self._audio:
+                    live.add(self._audio)
             clips = sorted(AUDIO.glob("reply-*.*"), key=lambda p: p.stat().st_mtime)
             for stale in clips[:-_MAX_AUDIO_CLIPS]:
+                if str(stale) in live:
+                    continue
                 stale.unlink(missing_ok=True)
         except OSError:
             pass

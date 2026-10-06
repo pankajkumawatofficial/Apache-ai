@@ -34,7 +34,11 @@ from app.tools.files import (                                  # noqa: E402
 from app.tools.sandbox import run_python                       # noqa: E402
 from app.voice.vad import EnergyVAD                            # noqa: E402
 from app.voice.tts import estimate_duration_s, speakable_text  # noqa: E402
-from app.voice.wake import clean_for_speech, match_wake        # noqa: E402
+from app.voice.wake import (                           # noqa: E402
+    clean_for_speech,
+    match_wake,
+    resolve_command,
+)
 
 FAILURES: list[str] = []
 
@@ -179,6 +183,34 @@ def test_wake_word() -> None:
     matched, cmd = match_wake("apache...", aliases)
     check("trailing dots consumed", matched and cmd == "", repr(cmd))
 
+    # ---- free talk: the wake word is a convenience, not a gate ----------
+    act, cmd = resolve_command("what time is it", aliases, wake_required=False)
+    check("answers without the wake word", act and cmd == "what time is it",
+          f"{act!r} {cmd!r}")
+
+    act, cmd = resolve_command("Apache, what time is it", aliases,
+                               wake_required=False)
+    check("still strips it when it is said",
+          act and cmd == "what time is it", repr(cmd))
+
+    act, cmd = resolve_command("what time is it", aliases, wake_required=True)
+    check("the gate still closes when asked for", not act, f"{act!r} {cmd!r}")
+
+    act, cmd = resolve_command("apache what time is it", aliases,
+                               wake_required=True)
+    check("and opens for a real command", act and cmd == "what time is it",
+          repr(cmd))
+
+    act, cmd = resolve_command("", aliases, wake_required=False)
+    check("silence is never a command", not act, f"{act!r} {cmd!r}")
+
+    act, cmd = resolve_command("   ", aliases, wake_required=False)
+    check("blank is never a command", not act, f"{act!r} {cmd!r}")
+
+    act, cmd = resolve_command("apache", aliases, wake_required=False)
+    check("the wake word alone still asks for a reply",
+          act and cmd == "", f"{act!r} {cmd!r}")
+
 
 def test_speech_cleanup() -> None:
     print("speech cleanup")
@@ -192,6 +224,16 @@ def test_speech_cleanup() -> None:
 
     spoken = speakable_text("Assistant: The answer is 42.")
     check("drops attribution", spoken.startswith("The answer"), repr(spoken))
+
+    # Every reply is spoken, errors included, so the marker that opens one
+    # has to go before the sentence is read out.
+    errored = speakable_text("⚠ Ollama is not running.")
+    check("errors lose the marker", not errored.startswith("⚠"), repr(errored))
+    check("errors keep their sentence",
+          "Ollama is not running" in errored, repr(errored))
+    check("an error label is not read out",
+          speakable_text("Error: could not reach the model").startswith("could not"),
+          repr(speakable_text("Error: could not reach the model")))
 
     long_reply = "This is sentence one. " * 200
     check("caps long reply", len(speakable_text(long_reply)) < 1_800)

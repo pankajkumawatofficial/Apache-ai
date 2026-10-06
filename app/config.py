@@ -57,9 +57,15 @@ DEFAULT_WAKE_ALIASES: list[str] = ["apache", "a patch", "a path", "app patch"]
 
 DEFAULT_SYSTEM_PROMPT = """\
 You are Apache, a local voice assistant running on the user's own machine.
+You are their friend first and their assistant second: warm, easygoing and
+human. Talk the way one person talks to another, never like a help desk.
 
 Communication rules — these matter because your replies are spoken aloud:
-- Be concise. One or two short sentences for a spoken answer whenever possible.
+- Be conversational. One or two short, natural sentences for a spoken answer
+  whenever possible, the way you would actually say them out loud.
+- Sound like a person, not a status readout: contractions ("it's", "you're"),
+  and a little warmth. Skip the formal openers — no "Certainly!", no "As an
+  AI", no restating the question back at them.
 - Never emit Markdown, code fences, bullet lists or tables in a spoken reply.
   Use plain prose. If code must be shown, put it on its own line and keep it short.
 - Never emit LaTeX or escape sequences: no $...$, no backslashes, no
@@ -143,12 +149,23 @@ class Settings:
     vad_keep_tail_ms: int = _env_int("VAD_KEEP_TAIL_MS", 300)
     stt_language: str = _env("STT_LANGUAGE", "en-US")
     tts_voice: str = _env("TTS_VOICE", "en-US-AndrewMultilingualNeural")
-    tts_rate: str = _env("TTS_RATE", "+0%")
+    # A brisk, human pace rather than a read-out one. Piper's length scale is
+    # derived from this (see tts._length_scale), so it applies offline too.
+    tts_rate: str = _env("TTS_RATE", "+10%")
+    # How much prosodic variation the synthesiser is allowed. Higher sounds
+    # more alive and less like a machine reading text; too high adds breath
+    # noise. Piper's own default is 0.667.
+    tts_noise_scale: float = _env_float("TTS_NOISE_SCALE", 0.8)
     # Mute the mic while we are talking so the assistant does not hear itself.
     playback_mute_s: float = _env_float("PLAYBACK_MUTE_S", 2.0)
     # Open the microphone as soon as the app starts, so "Apache" works
     # without a first click on the mic button. 0 starts it stopped.
     mic_autostart: bool = _env_bool("MIC_AUTOSTART", True)
+    # Whether Apache insists on being addressed by name. False -- the
+    # default -- makes every complete utterance a command and the wake word a
+    # convenience rather than a gate. APACHE_WAKE_REQUIRED=1 goes back to
+    # waiting for "Apache", which is what a noisy room wants.
+    wake_required: bool = _env_bool("WAKE_REQUIRED", False)
 
     # --- offline speech ---------------------------------------------------
     # Offline is the default. Every utterance over Google's endpoint and every
@@ -160,14 +177,17 @@ class Settings:
     # CPU; "small.en" is more accurate and roughly twice as slow.
     whisper_model: str = _env("WHISPER_MODEL", "base.en")
     whisper_dir: Path = Path(_env("WHISPER_DIR", str(MODELS / "whisper")))
-    # A Piper .onnx file with its .onnx.json sitting beside it.
+    # A Piper .onnx file with its .onnx.json sitting beside it. "high" is a
+    # larger model than the medium one it replaces, and the difference is the
+    # flatness that makes a synthesiser sound like a machine reading text.
+    # Other downloaded voices can be picked in the Voice tab.
     piper_voice: str = _env(
-        "PIPER_VOICE", str(MODELS / "piper" / "en_US-ryan-medium.onnx")
+        "PIPER_VOICE", str(MODELS / "piper" / "en_US-ryan-high.onnx")
     )
 
     # --- presence ---------------------------------------------------------
     # Spoken once when Apache comes up, before anyone has asked anything.
-    greeting: str = _env("GREETING", "Hello boss! What we will do today.")
+    greeting: str = _env("GREETING", "Hello Boss, what will we do today.")
     # Spoken when this many seconds pass with no input at all. The clock
     # restarts on any interaction and is held back while a reply is in
     # flight, so Apache never talks over its own answer. 0 disables it.

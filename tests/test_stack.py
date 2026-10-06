@@ -514,12 +514,13 @@ def test_offline_speech() -> None:
 
     # A voice that is not there must be reported, never raised as a crash --
     # and it must fail before loading, or this would cost another model load.
-    saved_path, saved_voice = tts.settings.piper_voice, tts._PIPER_VOICE
+    saved_path = tts.settings.piper_voice
+    saved_cache = dict(tts._PIPER_VOICES)
     try:
         tts.settings.piper_voice = str(
             Path(tempfile.gettempdir()) / "apache-definitely-missing.onnx"
         )
-        tts._PIPER_VOICE = None
+        tts._PIPER_VOICES.clear()
         try:
             tts.synthesize("hi", out)
             outcome = "NO ERROR"
@@ -528,7 +529,9 @@ def test_offline_speech() -> None:
         check("a missing voice is reported, not fatal",
               "no offline voice" in outcome, outcome)
     finally:
-        tts.settings.piper_voice, tts._PIPER_VOICE = saved_path, saved_voice
+        tts.settings.piper_voice = saved_path
+        tts._PIPER_VOICES.clear()
+        tts._PIPER_VOICES.update(saved_cache)
         out.unlink(missing_ok=True)
 
 
@@ -695,6 +698,137 @@ def test_audio_delivery() -> None:
         path.unlink(missing_ok=True)
 
 
+def test_voice_defaults() -> None:
+    """Apache should be ready to talk the moment it comes up."""
+    get_assistant, _, _, _ = _load_stack()
+    assistant = get_assistant()
+
+    check("greets with the line asked for",
+          assistant.settings.greeting == "Hello Boss, what will we do today.",
+          repr(assistant.settings.greeting))
+    check("listens on launch without a click", assistant.settings.mic_autostart,
+          repr(assistant.settings.mic_autostart))
+    check("answers without the wake word by default",
+          not assistant.settings.wake_required,
+          repr(assistant.settings.wake_required))
+    check("speaks replies by default", assistant.speak_replies,
+          repr(assistant.speak_replies))
+
+    from app.voice import tts
+
+    if not tts.settings.offline:
+        print("  skip: APACHE_OFFLINE=0 selects the online engine")
+        return
+    voices = tts.available_voices()
+    if not voices:
+        print("  skip: no Piper voices downloaded")
+        return
+
+    model = tts.resolve_model(assistant.voice)
+    check("the configured voice is on disk", model.exists(), str(model))
+    check("downloaded voices are offered in the dropdown",
+          model.stem in voices, f"{model.stem} not in {voices}")
+    check("an offered name resolves to a real file",
+          tts.resolve_model(voices[-1]).exists(), voices[-1])
+    check("a name typed in capitals still resolves",
+          tts.resolve_model(voices[-1].upper()).exists(), voices[-1].upper())
+    check("so does the filename form",
+          tts.resolve_model(f"{voices[-1]}.onnx").exists(), voices[-1])
+    check("an unknown voice falls back instead of failing",
+          tts.resolve_model("en_US-not-a-real-voice").exists(),
+          "missing model")
+
+
+def test_background_tab() -> None:
+    """A reply must still reach the speaker with another tab in front.
+
+    Gradio's Timer only dispatches when ``document.visibilityState`` reads
+    "visible", so going to another tab used to stop the queue being drained
+    entirely -- Apache kept thinking and kept answering, and none of it came
+    out of the speaker.
+    """
+    _g, _b, ui, _ = _load_stack()
+
+    js = ui._page_js()
+    check("the ticker is told the page is visible",
+          "visibilityState" in js and 'return "visible"' in js, js[:120])
+    check("the hidden flag is shadowed too", '"hidden"' in js, "missing")
+    check("a keep-alive keeps Chrome from throttling it",
+          "keepAlive" in js and "data:audio/wav" in js, "missing")
+    check("autoplay is unlocked on the first gesture",
+          "pointerdown" in js and "unlock" in js, "missing")
+    check("a reply the browser rejected is retried",
+          "retryBlockedReplies" in js, "missing")
+    # The % formatting that embeds the WAV must have run: a leftover
+    # placeholder would inject the literal "%s" into the page.
+    check("no unsubstituted placeholder left", "%s" not in js, "found one")
+    check("it is an IIFE that cannot leak globals", js.lstrip().startswith("(function"),
+          js.lstrip()[:40])
+
+    import base64
+
+    wav = ui._keepalive_wav()
+    header = base64.b64decode(wav.split(",", 1)[1])[:4]
+    check("the keep-alive decodes to a real WAV", header == b"RIFF", header)
+
+
+def test_errors_are_spoken() -> None:
+    """A failed turn reaches the speaker like any other reply.
+
+    Errors used to be written down and never said out loud, which from the
+    user's side of the screen is indistinguishable from Apache deciding not
+    to talk -- the one thing they cannot diagnose.
+    """
+    get_assistant, _, _, _ = _load_stack()
+    assistant = get_assistant()
+
+    from app.agent import AgentEvent
+
+    # Self-contained: whatever a previous test left behind must not decide
+    # what this one asserts -- and what this one does must not leak either.
+    assistant._release()
+    with assistant._lock:
+        saved_history = list(assistant._history)
+        assistant._history.clear()
+
+    spoken: list[str] = []
+    original = assistant._synthesize
+    assistant._synthesize = lambda text: spoken.append(text)  # type: ignore[method-assign]
+    try:
+        assistant._begin_turn("why is nothing working")
+        assistant._apply(AgentEvent("error", "Ollama is not running."))
+        assistant._finish_turn()
+        check("an error is spoken", len(spoken) == 1, repr(spoken))
+        check("with its message intact",
+              bool(spoken) and "Ollama is not running" in spoken[0],
+              repr(spoken))
+        check("and with the marker already in the history",
+              bool(assistant.snapshot()[0])
+              and assistant.snapshot()[0][-1]["content"].startswith("⚠"),
+              repr(assistant.snapshot()[0][-1]["content"]))
+
+        spoken.clear()
+        assistant._begin_turn("what is the capital of france")
+        assistant._apply(AgentEvent("final", "Paris."))
+        assistant._finish_turn()
+        check("a normal answer is spoken", len(spoken) == 1, repr(spoken))
+
+        assistant.speak_replies = False
+        spoken.clear()
+        assistant._begin_turn("and again")
+        assistant._apply(AgentEvent("final", "Paris."))
+        assistant._finish_turn()
+        check("the speak switch still silences it", spoken == [], repr(spoken))
+    finally:
+        assistant._synthesize = original  # type: ignore[method-assign]
+        assistant.speak_replies = True
+        # _begin_turn claims the busy flag; leaving it set would stop the
+        # next test's idle loop from ever firing.
+        assistant._release()
+        with assistant._lock:
+            assistant._history[:] = saved_history
+
+
 def test_presence_prompts() -> None:
     """Greeting at startup, a check-in after silence, and no chatter."""
     _g, _b, ui, _ = _load_stack()
@@ -808,6 +942,9 @@ def main() -> int:
         test_thinking_animation,
         test_jarvis_theme,
         test_audio_delivery,
+        test_voice_defaults,
+        test_background_tab,
+        test_errors_are_spoken,
         test_presence_prompts,
         # Kept last: it resets the shared conversation.
         test_stop_path,

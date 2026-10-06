@@ -14,8 +14,9 @@ Say **"Apache, …"** out loud, or just type. It answers with a voice.
 | **Conversation memory** | LangGraph `MemorySaver` checkpointer, one thread per session |
 | **Chat with your documents (RAG)** | Upload text/PDF → chunked → `OllamaEmbeddings` + cosine retrieval, with an automatic TF-IDF fallback when no embedding model is pulled |
 | **Code interpreter sandbox** | `subprocess` running `python -I` with a timeout, no stdin and bounded output |
-| **Wake word** | Continuous mic → energy VAD → Google speech-to-text → strip `"Apache"` → run the agent |
-| **Voice output** | Microsoft Edge neural voices via `edge-tts`, autoplayed in the browser |
+| **Free talk (wake word optional)** | Continuous mic → energy VAD → speech-to-text → run the agent. Saying `"Apache"` still works and is stripped; tick **Require the wake word** if you want only commands after it |
+| **Voice output** | Offline Piper voice, autoplayed in the browser — every reply spoken, errors included |
+| **Background tab** | Reaches the speaker with another tab in front (see *Design notes*) |
 | **Streaming** | Token-by-token replies plus a live tool-activity panel |
 
 ---
@@ -59,13 +60,24 @@ python -m pip install -r requirements.txt
 
 Voice runs offline by default, so the two engines need their models on disk
 once per machine. Whisper downloads itself into `models/whisper` the first time
-it is asked for; the Piper voice is a direct download:
+it is asked for; the Piper voice is a direct download. `en_US-ryan-high` is the
+default — a larger model than the medium one it replaces, and the difference is
+the flatness that makes a synthesiser sound like a machine reading text:
 
 ```powershell
 New-Item -ItemType Directory -Force models\piper | Out-Null
-$base = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium"
-Invoke-WebRequest "$base/en_US-ryan-medium.onnx"      -OutFile models\piper\en_US-ryan-medium.onnx
-Invoke-WebRequest "$base/en_US-ryan-medium.onnx.json" -OutFile models\piper\en_US-ryan-medium.onnx.json
+$base = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
+Invoke-WebRequest "$base/en/en_US/ryan/high/en_US-ryan-high.onnx" -OutFile models\piper\en_US-ryan-high.onnx
+Invoke-WebRequest "$base/en/en_US/ryan/high/en_US-ryan-high.onnx.json" -OutFile models\piper\en_US-ryan-high.onnx.json
+```
+
+Any other voice on this machine works the same way — drop the `.onnx` and its
+`.onnx.json` beside it and it appears in the **Voice** tab, where choosing it
+takes effect on the next reply:
+
+```powershell
+Invoke-WebRequest "$base/en/en_US/lessac/medium/en_US-lessac-medium.onnx" -OutFile models\piper\en_US-lessac-medium.onnx
+Invoke-WebRequest "$base/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json" -OutFile models\piper\en_US-lessac-medium.onnx.json
 ```
 
 `models/` is gitignored. If the voice is missing, Apache still runs and still
@@ -108,12 +120,14 @@ python run.py --port 8080     # different port
 Then, in the right-hand column:
 
 1. **Documents** tab → upload files → they are indexed for `search_documents`.
-2. Click **Start listening** and say *"Apache, what's the square root of 216?"*
+2. The microphone starts by itself. Just talk — *"what's the square root of
+   216?"* — no wake word needed, though saying *"Apache"* still works and is
+   stripped from what is asked.
 3. **Model** tab → pick your Ollama model, adjust temperature, apply.
-4. **Voice** tab → choose a voice, change the wake word, or turn spoken replies off.
+4. **Voice** tab → choose a voice, change the wake word, require the wake word
+   again (keeps a television from talking to you), or turn spoken replies off.
 
-Typed messages work identically to spoken ones — the wake word is only needed
-for microphone input.
+Typed messages work identically to spoken ones.
 
 ---
 
@@ -127,12 +141,15 @@ Every setting can be overridden with an `APACHE_`-prefixed environment variable
 | `APACHE_MODEL` | `qwen3:1.7b` | Ollama chat model |
 | `APACHE_OFFLINE` | `1` | Local speech engines; `0` switches to Google + edge-tts |
 | `APACHE_WHISPER_MODEL` | `base.en` | Local recogniser; `small.en` is more accurate, about twice as slow |
-| `APACHE_PIPER_VOICE` | `models/piper/en_US-ryan-medium.onnx` | Local voice file for spoken replies |
+| `APACHE_PIPER_VOICE` | `models/piper/en_US-ryan-high.onnx` | Local voice file for spoken replies |
+| `APACHE_TTS_RATE` | `+10%` | Pace of spoken replies; also sets Piper's length scale |
+| `APACHE_TTS_NOISE_SCALE` | `0.8` | Prosodic variation — lower is flatter, higher adds breath noise (Piper's own default is `0.667`) |
 | `APACHE_MIC_AUTOSTART` | `1` | Open the microphone as soon as the page opens |
+| `APACHE_WAKE_REQUIRED` | `0` | `1` goes back to waiting for the wake word before every command |
 | `APACHE_EMBEDDING_MODEL` | `nomic-embed-text` | RAG embedding model |
 | `APACHE_OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint |
 | `APACHE_OLLAMA_KEEP_ALIVE` | `-1` | How long Ollama keeps the model resident; `-1` is forever |
-| `APACHE_GREETING` | `Hello boss! What we will do today.` | Spoken once when the app starts |
+| `APACHE_GREETING` | `Hello Boss, what will we do today.` | Spoken once when the app starts |
 | `APACHE_IDLE_PROMPT_S` | `60` | Seconds of silence before a check-in; `0` disables it |
 | `APACHE_IDLE_PROMPT` | `Sir! Are you here?` | What Apache says when you have been quiet |
 | `APACHE_TEMPERATURE` | `0.2` | Sampling temperature |
@@ -215,6 +232,14 @@ rendered "Tools unavailable" and both existing suites passed throughout.
 it renders `Assistant.snapshot()`. A background `gr.Timer` polls that snapshot
 so voice-initiated turns appear without a second streaming path.
 
+**The wake word gates when asked for, not by default.** Every complete
+utterance is a command unless `APACHE_WAKE_REQUIRED=1`. The decision is one
+pure function — `voice.wake.resolve_command()` — so it is testable without a
+microphone: a leading wake word is still stripped, so *"Apache, what time is
+it"* and *"what time is it"* arrive identically, and silence is never a
+command. Requiring it is worth doing in a noisy room; it used to be the only
+mode, which meant nothing worked until you said the magic word.
+
 **Streaming.** The agent is run with `stream_mode=["updates", "messages"]`:
 message chunks from the `model` node stream tokens as they arrive, while
 `updates` from the `model` and `tools` nodes supply tool calls and their
@@ -260,6 +285,42 @@ and simply never spoke. The player asks `clip_extension()` for the engine's
 real format, so the file is served untouched. Swap engines and this is the
 silent one to watch for.
 
+**Reaching the speaker is browser work, not Python work.** Getting a clip as
+far as the page and getting it out of the speaker are different failures, and
+three of them all present as "Apache is not talking". `_page_js()` in
+`app/ui.py` handles each:
+
+1. *Gradio stops ticking when the tab is hidden.* Its Timer dispatches only
+   `if (document.visibilityState === "visible")`, so the moment another tab is
+   in front, the audio queue is never drained and the transcript never
+   updates — however healthy everything server-side is. The guard reads the
+   property on every tick, so shadowing it on the document keeps the ticks
+   coming. Everything else about Apache (listening, the agent, synthesis) was
+   already server-side and unaffected.
+2. *Chrome throttles a hidden tab's timers*, to once a second and then, after
+   five minutes, to once a minute — exempting pages that are playing audio.
+   A looping, 44 dB-down tone buys that exemption, so a reply spoken into a
+   tab you are no longer looking at arrives on time instead of up to a minute
+   late.
+3. *Chrome blocks media that starts without a user gesture*, and Apache's
+   first words are the greeting, spoken before anyone has clicked anything —
+   which is the whole point of a voice assistant. One inaudible buffer on the
+   first interaction unlocks the origin for good; any reply the browser had
+   rejected is retried every second until it plays.
+
+**Pruning must not outrun playback.** The clip store keeps the newest twenty
+files, but the queue and the clip currently playing are exactly the files that
+must survive — trimming one of those deletes a reply that was written,
+queued, and then quietly made inaudible, which is indistinguishable from
+Apache failing to speak.
+
+**Nothing is written down and left unsaid.** Errors and interrupted turns used
+to be skipped by the synthesiser, so a failed reply was visible on screen and
+silent on the speaker — from the user's side of the screen identical to
+Apache choosing not to talk, which is the one thing they cannot diagnose.
+Every reply is spoken now, markers stripped first so `⚠` is not read aloud as
+nothing.
+
 **The gate sits above the room, not above your voice.** The speech gate is the
 noise floor times a multiplier, and at 3.5 it measured `0.0283` against a room
 level of `0.0073` -- 3.9x ambient, which an ordinary voice does not sustain
@@ -288,8 +349,8 @@ comes back as an empty transcript even when every word is audible.
 
 **Stoppable turns.** Every agent event is checked against a stop flag, and the
 agent yields per token, so **Stop** takes effect in roughly one token. A
-stopped turn skips speech synthesis, leaves whatever partial text arrived and
-releases the busy flag immediately.
+stopped turn releases the busy flag immediately and speaks what it stopped
+with, so an interrupted turn never ends in silence.
 
 **Retrieval degrades rather than breaks.** If `nomic-embed-text` is not
 pulled, or Ollama refuses the request, the store falls back to an in-process
@@ -430,9 +491,11 @@ its own system applications — use the Windows Security toggle instead.
 | `model '…' not found` | `ollama pull <model>` |
 | Tools never fire | Use a tool-calling model; `qwen3:8b` never skips them, the default `qwen3:1.7b` occasionally does |
 | Documents answer weakly | `ollama pull nomic-embed-text`, then re-upload |
-| No wake word response | Check the **Voice** panel state; the mic may be muted, stopped, or have hit repeated STT failures |
+| No wake word response | Check the **Voice** panel state; the mic may be muted, stopped, or have hit repeated STT failures. Note the wake word is **optional by default** — tick **Require the wake word** (or `APACHE_WAKE_REQUIRED=1`) only if you want it back |
 | `Speech recognition failed` repeatedly | The listener stops after 5 consecutive failures to avoid spinning; restart it with the mic button |
 | No spoken replies | Untick **Speak replies aloud** only if you meant to. Otherwise run `run.py --check` and read the **Speech models** line — a missing Piper voice fails silently, and Apache looks perfectly healthy while saying nothing |
+| Nothing is spoken until I click something | Chrome blocks audio that starts without a gesture, and Apache's first words are the greeting. Click the page once — after that the origin is unlocked for good and every later reply plays on its own |
+| Replies stop arriving when I switch to another tab | Fixed in `app/ui.py::_page_js()` (see *Design notes*). If it still happens, check that a content blocker is not stripping the injected script |
 | Microphone never starts by itself | `APACHE_MIC_AUTOSTART=1` is the default; the **Voice** panel reports a device that refused to open |
 | Voice input is slow or stops after a burst | That was Google throttling recognitions. Offline mode (`APACHE_OFFLINE=1`) has no endpoint to throttle |
 | `pip.exe` is blocked | Use `python -m pip` instead |

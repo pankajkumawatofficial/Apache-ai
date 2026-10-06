@@ -19,14 +19,17 @@ import tempfile
 import threading
 import wave
 from pathlib import Path
+from typing import Any
 
-from ..config import settings
+from ..config import MODELS, settings
 from .wake import clean_for_speech
 
 __all__ = [
     "TTSUnavailable",
+    "available_voices",
     "clip_extension",
     "estimate_duration_s",
+    "resolve_model",
     "speakable_text",
     "synthesize",
     "warm_up",
@@ -34,9 +37,13 @@ __all__ = [
 
 DEFAULT_VOICE = "en-US-AndrewMultilingualNeural"
 
+#: Where downloaded Piper voices live.
+PIPER_DIR = MODELS / "piper"
+
 #: Loaded on first use and kept: Piper takes seconds to load and milliseconds
-#: to speak, so reloading it per reply would undo the whole point.
-_PIPER_VOICE = None
+#: to speak, so reloading it per reply would undo the whole point. Keyed by
+#: the ONNX path, so changing voice costs one load rather than one per reply.
+_PIPER_VOICES: dict[str, Any] = {}
 #: The greeting, an idle check-in and a first reply can all reach the voice
 #: at once, so loading is serialised rather than raced.
 _PIPER_LOCK = threading.Lock()
@@ -58,6 +65,12 @@ def speakable_text(text: str) -> str:
 
     # "Assistant: ..." / "Apache: ..." prefixes.
     cleaned = re.sub(r"(?i)^\s*(assistant|apache)\s*:\s*", "", cleaned)
+
+    # Markers are silent to a synthesiser and only ever sound like a stumble.
+    # Errors are spoken too -- every reply is spoken -- so the warning sign
+    # that opens one has to go before the sentence it decorates is read out.
+    cleaned = re.sub(r"[⚠✓✔✗✖★☆→←↑↓●■]+", " ", cleaned)
+    cleaned = re.sub(r"(?i)^\s*(error|warning|notice)\s*[:\-]\s*", "", cleaned)
 
     max_chars = 1_500
     if len(cleaned) > max_chars:
@@ -97,34 +110,75 @@ async def _save(text: str, voice: str, rate: str, path: Path) -> None:
     await communicate.save(str(path))
 
 
-def _piper_voice():
-    """Load the local voice once and keep it in memory.
+def available_voices() -> list[str]:
+    """Piper voices already on disk, for the Voice dropdown.
+
+    Offline, the dropdown used to list edge-tts names that the engine then
+    ignored -- so "speak in a different voice" was a control that did
+    nothing. This is what it should have been offering.
+    """
+    try:
+        return sorted(p.stem for p in PIPER_DIR.glob("*.onnx"))
+    except OSError:  # pragma: no cover - unreadable models directory
+        return []
+
+
+def resolve_model(voice: str | None = None) -> Path:
+    """Pick the ONNX to speak with, honouring a voice chosen in the UI.
+
+    Accepts a bare name ("en_US-lessac-medium"), a filename, or a path, and
+    compares names case-insensitively because that is how people type them --
+    the filesystem's own rules are not something a dropdown should expose.
+    Anything that is not on disk falls back to the configured model: a stale
+    dropdown value must degrade to "sounds like the usual Apache", never to
+    silence.
+    """
+    wanted = (voice or "").strip()
+    if wanted:
+        stem = Path(wanted).name
+        if stem.lower().endswith(".onnx"):
+            stem = stem[: -len(".onnx")]
+        for candidate in (PIPER_DIR / f"{stem}.onnx", Path(wanted)):
+            if candidate.exists():
+                return candidate
+        lowered = stem.lower()
+        for candidate in PIPER_DIR.glob("*.onnx"):
+            if candidate.stem.lower() == lowered:
+                return candidate
+    return Path(settings.piper_voice)
+
+
+def _piper_voice(model: Path | None = None):
+    """Load a local voice once and keep it in memory.
 
     Double-checked under a lock: the greeting, an idle check-in and a first
-    reply can all arrive together, and two threads loading 60 MB at once is
+    reply can all arrive together, and two threads loading 100 MB at once is
     how the first spoken line ends up several seconds late.
     """
-    global _PIPER_VOICE
-    if _PIPER_VOICE is not None:
-        return _PIPER_VOICE
+    target = resolve_model(None) if model is None else Path(model)
+    key = str(target)
+    cached = _PIPER_VOICES.get(key)
+    if cached is not None:
+        return cached
 
     with _PIPER_LOCK:
-        if _PIPER_VOICE is not None:
-            return _PIPER_VOICE
+        cached = _PIPER_VOICES.get(key)
+        if cached is not None:
+            return cached
 
         from piper import PiperVoice  # optional dependency, imported on use
 
-        model = Path(settings.piper_voice)
-        if not model.exists():
+        if not target.exists():
             raise TTSUnavailable(
-                f"no offline voice at {model}. Fetch it once following the README, "
+                f"no offline voice at {target}. Fetch it once following the README, "
                 "or set APACHE_OFFLINE=0 to go back to edge-tts."
             )
         try:
-            _PIPER_VOICE = PiperVoice.load(str(model))
+            loaded = PiperVoice.load(str(target))
         except Exception as exc:  # noqa: BLE001 - a bad download must not wedge
-            raise TTSUnavailable(f"could not load {model.name}: {exc}") from exc
-    return _PIPER_VOICE
+            raise TTSUnavailable(f"could not load {target.name}: {exc}") from exc
+        _PIPER_VOICES[key] = loaded
+    return loaded
 
 
 def warm_up() -> bool:
@@ -169,21 +223,23 @@ def _length_scale(rate: str) -> float:
     return 1.0 / speed
 
 
-def _piper_speech(spoken: str, path: Path, rate: str) -> None:
+def _piper_speech(
+    spoken: str, path: Path, rate: str, voice: str | None = None
+) -> None:
     """Synthesise locally. No network, and the model stays loaded."""
-    voice = _piper_voice()
-    scale = _length_scale(rate)
-    config = None
-    if abs(scale - 1.0) > 1e-6:
-        from piper import SynthesisConfig
+    engine = _piper_voice(resolve_model(voice))
+    # Both knobs decide how human this sounds: length scale is pace, noise
+    # scale is how much the voice may vary between runs. Flat prosody at a
+    # metronome pace is exactly what reads as a machine reading text.
+    from piper import SynthesisConfig
 
-        config = SynthesisConfig(length_scale=scale)
+    config = SynthesisConfig(
+        length_scale=_length_scale(rate),
+        noise_scale=float(settings.tts_noise_scale),
+    )
     try:
         with wave.open(str(path), "wb") as handle:
-            if config is None:
-                voice.synthesize_wav(spoken, handle)
-            else:
-                voice.synthesize_wav(spoken, handle, syn_config=config)
+            engine.synthesize_wav(spoken, handle, syn_config=config)
     except Exception as exc:  # noqa: BLE001 - audio must never break a turn
         raise TTSUnavailable(f"offline synthesis failed: {exc}") from exc
 
@@ -217,7 +273,7 @@ def synthesize(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if settings.offline:
-        _piper_speech(spoken, path, rate)
+        _piper_speech(spoken, path, rate, voice)
     else:
         _edge_speech(spoken, path, voice, rate)
 

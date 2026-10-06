@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["match_wake", "clean_for_speech"]
+__all__ = ["match_wake", "resolve_command", "clean_for_speech"]
 
 # Trailing punctuation/whitespace consumed along with the wake word itself.
 _TAIL = r"[\s,.;:!?\-—'\"`]*"
@@ -52,6 +52,31 @@ def match_wake(text: str, aliases: list[str]) -> tuple[bool, str]:
 
     command = text[match.end():].strip()
     return True, command
+
+
+def resolve_command(
+    text: str, aliases: list[str], wake_required: bool = True
+) -> tuple[bool, str]:
+    """Decide what, if anything, from *text* should be run.
+
+    Returns ``(act, command)`` -- an utterance to run, or an utterance to
+    ignore -- because the listener only has those two options and confusing
+    them is expensive either way.
+
+    With *wake_required* the wake word gates everything, and a transcript
+    without it is dropped. That is what a television, a neighbour or someone
+    in the next room sounds like from inside a microphone.
+
+    Without it every complete utterance is a command, but a leading wake word
+    is still stripped, so "Apache, what time is it" and "what time is it"
+    both arrive as "what time is it" and behave identically.
+    """
+    matched, stripped = match_wake(text, aliases)
+    if matched:
+        return True, stripped
+    if wake_required or not text or not text.strip():
+        return False, ""
+    return True, text.strip()
 
 
 def clean_for_speech(text: str) -> str:
