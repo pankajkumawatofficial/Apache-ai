@@ -10,6 +10,7 @@ conversation history per session.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -88,12 +89,54 @@ def _format_tool_args(args: Any) -> str:
     return ", ".join(rendered)
 
 
-def _tool_result_summary(message: Any, limit: int = 160) -> str:
-    body = _content_to_text(getattr(message, "content", "")).strip()
+def _summarise(body: str, limit: int = 160) -> str:
     body = " ".join(body.split())
     if len(body) > limit:
         body = body[:limit] + "..."
     return body or "(no result)"
+
+
+def _tool_result_summary(message: Any, limit: int = 160) -> str:
+    body = _content_to_text(getattr(message, "content", "")).strip()
+    return _summarise(body, limit)
+
+
+#: The tool call a small model writes out instead of emitting one: the tool
+#: name, then its arguments as JSON. The runtime has already decided this is
+#: ordinary prose by the time it arrives, so it would be spoken aloud --
+#: "play_media_tool open brace quote request quote colon ..." read out to
+#: whoever asked for a song.
+_TEXT_TOOL_CALL = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\n?\s*(\{.*\})\s*$", re.S)
+
+
+def _run_text_tool_call(
+    text: str, tools: list[Any]
+) -> tuple[str, dict, str] | None:
+    """Run a tool call the model wrote out as text, or ``None``.
+
+    Returns ``(name, arguments, result)`` when *text* is recognisably a
+    call to one of *tools*. Anything else is a normal reply and is left
+    alone -- the shape being matched is specific enough that prose has no
+    reason to fit it.
+    """
+    match = _TEXT_TOOL_CALL.match(text or "")
+    if not match:
+        return None
+    name, raw_args = match.group(1), match.group(2)
+    tool = next((t for t in tools if getattr(t, "name", "") == name), None)
+    if tool is None:
+        return None
+    try:
+        args = json.loads(raw_args)
+    except Exception:  # noqa: BLE001 - not a call, just a sentence
+        return None
+    if not isinstance(args, dict):
+        return None
+    try:
+        result = tool.invoke(args)
+    except Exception as exc:  # noqa: BLE001 - report it, never raise it
+        return name, args, f"Error: {type(exc).__name__}: {exc}"
+    return name, args, _content_to_text(result)
 
 
 class AgentRunner:
@@ -245,9 +288,22 @@ class AgentRunner:
                             streamed = ""
                         elif isinstance(message, (AIMessage, AIMessageChunk)):
                             text = _content_to_text(message.content)
-                            if text:
+                            if not text:
+                                continue
+                            # Still a call, whatever the transport decided:
+                            # run it rather than read it out loud.
+                            recovered = _run_text_tool_call(text, self.tools)
+                            if recovered is None:
                                 final_text = text
                                 yield AgentEvent("final", text)
+                                continue
+                            name, args, result = recovered
+                            yield AgentEvent(
+                                "tool_call", f"{name}({_format_tool_args(args)})"
+                            )
+                            yield AgentEvent("tool", f"{name}: {_summarise(result)}")
+                            final_text = result
+                            yield AgentEvent("final", result)
 
         except Exception as exc:
             yield AgentEvent("error", _detail(exc))

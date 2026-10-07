@@ -130,7 +130,12 @@ def _transcribe_local(samples: Any, sample_rate: int, language: str) -> str:
         segments, _info = model.transcribe(
             audio,
             language=_whisper_language(language),
-            beam_size=1,
+            # Greedy decoding (1) takes the first word that fits each frame,
+            # which is how a noisy utterance came back as "45" for
+            # "spotify". Whisper's own default width scores whole candidates
+            # before committing; it is the cheaper half of the fix, the
+            # larger model above being the other.
+            beam_size=max(1, int(settings.whisper_beam)),
             vad_filter=False,
             # A local model with no history is more predictable, and this is
             # one utterance at a time rather than a transcript.

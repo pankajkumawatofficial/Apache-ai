@@ -10,8 +10,39 @@ merely *mentions* Apache does not fire the assistant.
 from __future__ import annotations
 
 import re
+import unicodedata
 
 __all__ = ["match_wake", "resolve_command", "clean_for_speech"]
+
+#: Symbols a synthesiser cannot pronounce. Emoji are the ones that reach it
+#: most often -- a small model likes to close a reply with a musical note,
+#: and the reading comes out as nonsense syllables for a code point that
+#: means nothing to a screen reader, let alone a speaker. This is the
+#: Unicode "other symbol" class (doodads, dingbats, arrows, pictographs,
+#: flags) plus "enclosing mark" (the keycap ring under a "1").
+_SILENT_CATEGORIES = frozenset({"So", "Me"})
+
+#: The parts of an emoji sequence that carry meaning only to a renderer:
+#: the joiner that chains several pictures into one, the variation selector
+#: that picks the pictographic form, and the skin-tone modifiers.
+_SILENT_CHARS = frozenset(
+    {"\u200d", "\ufe0e", "\ufe0f", *map(chr, range(0x1F3FB, 0x1F400))}
+)
+
+
+def _strip_symbols(text: str) -> str:
+    """Replace every unpronounceable symbol with a space.
+
+    A space rather than nothing at all: ``song🎵great`` has to come out as
+    three words, not one invented one.
+    """
+    out = []
+    for char in text:
+        if char in _SILENT_CHARS or unicodedata.category(char) in _SILENT_CATEGORIES:
+            out.append(" ")
+        else:
+            out.append(char)
+    return "".join(out)
 
 # Trailing punctuation/whitespace consumed along with the wake word itself.
 _TAIL = r"[\s,.;:!?\-—'\"`]*"
@@ -111,6 +142,9 @@ def clean_for_speech(text: str) -> str:
     # Table separators and pipes read badly.
     out = re.sub(r"(?m)^\s*\|?[\s:|-]+\|\s*$", " ", out)
     out = out.replace("|", ". ")
+
+    # Last, so the spaces it leaves behind are collapsed with the rest.
+    out = _strip_symbols(out)
 
     out = re.sub(r"[ \t]+", " ", out)
     out = re.sub(r"\n{2,}", "\n", out)

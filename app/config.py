@@ -77,8 +77,11 @@ Communication rules — these matter because your replies are spoken aloud:
   AI", no restating the question back at them.
 - Never emit Markdown, code fences, bullet lists or tables in a spoken reply.
   Use plain prose. If code must be shown, put it on its own line and keep it short.
+- Never emit emoji, symbols or decorative marks either. They carry no sound,
+  so the synthesiser turns them into nonsense syllables at the end of your
+  sentence. End with a word, not a picture.
 - Never emit LaTeX or escape sequences: no $...$, no backslashes, no
-  \times or \frac. Write arithmetic in plain words instead
+  \\times or \\frac. Write arithmetic in plain words instead
   ("1739 times 42"), because the reply is read aloud by a synthesiser.
 - If a tool gives you a number or fact, state the result directly, not the reasoning.
 - If you do not know something and no tool can help, say so plainly.
@@ -96,6 +99,11 @@ Tool guidance:
 - When the user asks to open, start, launch or show something, call the tool
   immediately and confirm afterwards in one sentence. Never ask which they
   meant first, and never explain what you would do instead of doing it.
+- To play music or video, call play_media. Its request argument is what
+  should be played -- a title, an artist, a genre -- and it is the only one
+  the tool takes. It finds the actual song and that song starts on its own;
+  open_url would open a page that sits there in silence, which is not
+  playing anything.
 """
 
 
@@ -192,9 +200,18 @@ class Settings:
     # intermittently silent. APACHE_OFFLINE=0 goes back to the online engines.
     offline: bool = _env_bool("OFFLINE", True)
     # Whisper size. "base.en" is ~75 MB and several times real time on this
-    # CPU; "small.en" is more accurate and roughly twice as slow.
-    whisper_model: str = _env("WHISPER_MODEL", "base.en")
+    # CPU; "small.en" is more accurate and roughly twice as slow. It is the
+    # default because "base.en" heard "45" for "spotify" -- size is only half
+    # of that, beam width below is the other half. Both download themselves
+    # into whisper_dir on first use.
+    whisper_model: str = _env("WHISPER_MODEL", "small.en")
     whisper_dir: Path = Path(_env("WHISPER_DIR", str(MODELS / "whisper")))
+    # Decoding width. 1 is greedy: the fastest reading of the audio, and the
+    # one most likely to commit to a wrong word on the first noisy frame.
+    # Whisper's own default is 5, which scores whole candidates before
+    # choosing -- that is where most of the accuracy lives, and it costs
+    # well under a second on a short utterance.
+    whisper_beam: int = _env_int("WHISPER_BEAM", 5)
     # A Piper .onnx file with its .onnx.json sitting beside it. The default is
     # the medium Ryan; en_US-ryan-high sits beside it as the larger of the two
     # on disk, and the Voice tab switches between them -- or any other

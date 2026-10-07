@@ -18,7 +18,7 @@ from typing import Any
 from ..config import Settings, settings as default_settings
 from ..rag import DocumentStore, format_hits
 from .calculator import CalcError, safe_eval
-from .control import ControlError, open_app, open_file, open_url
+from .control import ControlError, open_app, open_file, open_url, play_media
 from .files import FileAccessError, list_files, read_file, write_file
 from .sandbox import run_python
 
@@ -173,10 +173,31 @@ def build_tools(
         that turns out to be a site still works.
 
         This is the tool for "open <something>"; open_url is for a specific
-        page the user wants to read.
+        page the user wants to read, and play_media for something they want
+        to hear.
         """
         try:
             return open_app(name)
+        except ControlError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def play_media_tool(request: str) -> str:
+        """Find a song or video and start it playing.
+
+        Use this for every "play" request: "play some music", "put on
+        Bohemian Rhapsody", "play the new Adele song". The ``request``
+        argument is what should be played -- a title, an artist, a genre --
+        and nothing else goes in it. The match it opens starts on its own;
+        a search page does not, which is why this exists rather than
+        open_url.
+
+        Naming Spotify opens the desktop app on a search, because a track
+        cannot be started there without an account key -- say so plainly
+        rather than implying the music began.
+        """
+        try:
+            return play_media(request)
         except ControlError as exc:
             return f"Error: {exc}"
 
@@ -204,6 +225,7 @@ def build_tools(
         current_datetime,
         open_url_tool,
         open_app_tool,
+        play_media_tool,
         open_file_tool,
     ]
 

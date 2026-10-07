@@ -56,6 +56,7 @@ EXPECTED_TOOLS = {
     "current_datetime",
     "open_url_tool",
     "open_app_tool",
+    "play_media_tool",
     "open_file_tool",
     "web_search",
 }
@@ -111,6 +112,61 @@ def test_tool_registry() -> None:
                    if not getattr(t, "description", None)]
     check("every tool carries a description", not undescribed,
           f"undescribed={undescribed}")
+
+
+def test_text_tool_call() -> None:
+    """A tool call written out as prose is still a tool call.
+
+    qwen3 formats some calls itself -- the tool name, then its arguments as
+    JSON -- and the runtime has already decided by then that it is looking
+    at prose. Left alone, Apache reads the whole thing aloud.
+    """
+    print("text tool calls")
+    from app.agent import _run_text_tool_call
+
+    ran: list[dict] = []
+
+    class _Tool:
+        name = "play_media_tool"
+
+        def invoke(self, args):
+            ran.append(args)
+            return "Playing Bohemian Rhapsody."
+
+    tool = _Tool()
+
+    name, args, result = _run_text_tool_call(
+        'play_media_tool\n{"request": "bohemian rhapsody"}', [tool])
+    check("a name and JSON on separate lines is run",
+          name == "play_media_tool"
+          and args == {"request": "bohemian rhapsody"}
+          and "Playing" in result, f"{name=} {args=} {result=}")
+    check("and the tool really ran",
+          ran == [{"request": "bohemian rhapsody"}], repr(ran))
+
+    name, _args, _result = _run_text_tool_call(
+        'play_media_tool {"request": "despacito"}', [tool])
+    check("the same on one line", name == "play_media_tool", repr(name))
+
+    check("an ordinary sentence is left alone",
+          _run_text_tool_call("I opened Spotify for you.", [tool]) is None, "")
+    check("broken JSON is left alone",
+          _run_text_tool_call("play_media_tool\n{oops}", [tool]) is None, "")
+    check("a tool that is not registered is left alone",
+          _run_text_tool_call('nope_tool\n{"a": 1}', [tool]) is None, "")
+    check("a bare JSON object is not a call",
+          _run_text_tool_call('{"request": "x"}', [tool]) is None, "")
+
+    class _Boom:
+        name = "calculator"
+
+        def invoke(self, args):
+            raise ValueError("bad expression")
+
+    _, _, result = _run_text_tool_call(
+        'calculator\n{"expression": "1+"}', [_Boom()])
+    check("a tool that raises is reported, not raised",
+          result.startswith("Error:"), repr(result))
 
 
 def test_rag_end_to_end() -> None:
@@ -1024,6 +1080,7 @@ def main() -> int:
     for suite in (
         test_assistant,
         test_tool_registry,
+        test_text_tool_call,
         test_rag_end_to_end,
         test_gradio_ui,
         test_status_helpers,

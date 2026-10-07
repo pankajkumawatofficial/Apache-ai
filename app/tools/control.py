@@ -12,10 +12,14 @@ desktop.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
+import urllib.parse
 import webbrowser
 from pathlib import Path
+
+from .websearch import find_video
 
 __all__ = [
     "ControlError",
@@ -24,6 +28,7 @@ __all__ = [
     "open_file",
     "open_folder",
     "open_url",
+    "play_media",
     "resolve_target",
 ]
 
@@ -356,6 +361,55 @@ def open_app(name: str) -> str:
     if site:
         return f"{open_url(site)} (no {wanted} program is installed here)"
     raise ControlError(f"no program named {wanted!r} is installed here")
+
+
+#: The words around what is actually meant when a request names Spotify.
+_SPOTIFY_FILLER = re.compile(r"\b(on|in|with|from|using|the|app|please|spotify)\b",
+                             re.IGNORECASE)
+
+
+def play_media(request: str) -> str:
+    """Open the closest match to *request* so that it starts playing.
+
+    Opening is not playing. Handing back a search page for a song request
+    opens something and makes no sound, which reads as Apache failing to do
+    the one thing asked of it -- so the lookup here returns a watch page,
+    the only kind of page that starts on its own.
+
+    Spotify is the exception worth stating rather than pretending away: the
+    desktop app can be pointed at a search but not at *play*, because that
+    needs an account key this machine has not got. It is opened on the
+    right page and the request is answered honestly instead of quietly
+    doing half of it.
+    """
+    text = (request or "").strip().strip('"')
+    if not text:
+        raise ControlError("nothing to play was given")
+
+    if "spotify" in text.casefold():
+        terms = " ".join(_SPOTIFY_FILLER.sub(" ", text).split())
+        if not terms:
+            return open_app("spotify")
+        uri = "spotify:search:" + urllib.parse.quote(terms, safe="")
+        try:
+            _launch(uri)
+        except Exception as exc:  # noqa: BLE001 - the OS reports these unevenly
+            raise ControlError(f"could not open Spotify: {exc}") from exc
+        return (f"Opened Spotify on a search for {terms}. Pick the track to "
+                "start it -- a song cannot be started in Spotify from here.")
+
+    # `find_video` returning nothing means the search backend was unreachable
+    # or found no video at all -- not that the request was wrong, so the
+    # results page is the fallback rather than an error.
+    found = find_video(text)
+    if found:
+        url, title = found
+        open_url(url)
+        return f"Playing {title}."
+
+    page = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(text)
+    open_url(page)
+    return f"No single match for {text}; opened the results so you can pick one."
 
 
 def open_file(path: str, workspace: Path) -> str:

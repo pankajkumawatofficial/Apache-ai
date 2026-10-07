@@ -222,6 +222,37 @@ def test_speech_cleanup() -> None:
     check("strips bold", clean_for_speech("**bold**") == "bold")
     check("strips inline code", clean_for_speech("`x = 1`") == "x = 1")
 
+    # A small model closes replies with a musical note, and a synthesiser
+    # reads a code point out loud as though it spelled something. Symbols
+    # are for the eye; they must never reach the speaker.
+    check("drops an astral emoji",
+          "\U0001F3B5" not in clean_for_speech("Enjoy the tune \U0001F3B5"),
+          repr(clean_for_speech("Enjoy the tune \U0001F3B5")))
+    check("and the sentence around it survives",
+          clean_for_speech("Enjoy the tune \U0001F3B5").startswith("Enjoy the tune"),
+          repr(clean_for_speech("Enjoy the tune \U0001F3B5")))
+    check("splits on an emoji stuck between words",
+          clean_for_speech("song\U0001F3B5great") == "song great",
+          repr(clean_for_speech("song\U0001F3B5great")))
+    check("drops a joined emoji sequence",
+          not any(ch in clean_for_speech("\U0001F468\u200d\U0001F469\u200d\U0001F467")
+                  for ch in "\U0001F468\U0001F469\U0001F467\u200d"),
+          repr(clean_for_speech("\U0001F468\u200d\U0001F469\u200d\U0001F467")))
+    check("drops a skin-tone modifier",
+          not clean_for_speech("wave \U0001F44B\U0001F3FD").endswith("\U0001F3FD"),
+          repr(clean_for_speech("wave \U0001F44B\U0001F3FD")))
+    check("drops a flag",
+          "\U0001F1EC\U0001F1E7" not in clean_for_speech("hello \U0001F1EC\U0001F1E7"),
+          repr(clean_for_speech("hello \U0001F1EC\U0001F1E7")))
+    check("keeps the letters and digits around them",
+          clean_for_speech("\U0001F3B5 42 songs") == "42 songs",
+          repr(clean_for_speech("\U0001F3B5 42 songs")))
+    check("the spoken reply is clean too",
+          "\U0001F3B5" not in speakable_text("There you go \U0001F3B5"),
+          repr(speakable_text("There you go \U0001F3B5")))
+    check("and currency still reads as money",
+          "$5" in speakable_text("It costs $5."), repr(speakable_text("It costs $5.")))
+
     spoken = speakable_text("Assistant: The answer is 42.")
     check("drops attribution", spoken.startswith("The answer"), repr(spoken))
 
@@ -345,7 +376,7 @@ def test_computer_control() -> None:
     real_browser_for_urls = control.browser_for_urls
     originals = (control._launch, control._spawn, control.browser_for_urls,
                  control._app_paths_entries, control._windows_apps_entries,
-                 control._start_menu_entries)
+                 control._start_menu_entries, control.find_video)
     control._launch = launched.append
     control._spawn = spawned.append
     control.browser_for_urls = lambda: None
@@ -513,11 +544,171 @@ def test_computer_control() -> None:
         control.open_url("spotify")
         check("a bare service name opens the real site",
               launched[-1] == "https://open.spotify.com", repr(launched[-1]))
+
+        # Playing is not opening: a search page opens without a sound, so
+        # only a watch page counts as having played something.
+        control.find_video = lambda q: ("https://www.youtube.com/watch?v=abc123",
+                                        "Bohemian Rhapsody")
+        outcome = control.play_media("bohemian rhapsody")
+        check("a found track opens its watch page",
+              str(launched[-1]) == "https://www.youtube.com/watch?v=abc123",
+              repr(launched[-1]))
+        check("and the reply says what is playing",
+              "Bohemian Rhapsody" in outcome, repr(outcome))
+
+        control.find_video = lambda q: None
+        outcome = control.play_media("some song")
+        check("no match falls back to the results page",
+              str(launched[-1]).startswith(
+                  "https://www.youtube.com/results?search_query="),
+              repr(launched[-1]))
+        check("and it does not claim to be playing",
+              "pick one" in outcome, repr(outcome))
+
+        # Spotify can be pointed at a search but not told to press play --
+        # that needs an account key. The reply has to say so rather than
+        # leave the user waiting for music that was never started.
+        outcome = control.play_media("play shape of you on spotify")
+        check("a Spotify request opens the app on a search",
+              str(launched[-1]).startswith("spotify:search:"),
+              repr(launched[-1]))
+        check("and says the track still needs picking",
+              "Pick the track" in outcome, repr(outcome))
+        check("with the filler words out of the search",
+              str(launched[-1]) == "spotify:search:play%20shape%20of%20you",
+              repr(launched[-1]))
+
+        try:
+            control.play_media("   ")
+            outcome = "NOT REFUSED"
+        except ControlError as exc:
+            outcome = str(exc)
+        check("an empty request to play is refused",
+              "nothing to play" in outcome, outcome)
     finally:
         (control._launch, control._spawn, control.browser_for_urls,
          control._app_paths_entries, control._windows_apps_entries,
-         control._start_menu_entries) = originals
+         control._start_menu_entries, control.find_video) = originals
         shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_video_search() -> None:
+    """A song request has to come back as something that plays itself."""
+    print("video search")
+    from app.tools import websearch
+
+    def fake_backend(videos=None, texts=(), broken=()):
+        """A stand-in for DDGS, returning canned results per endpoint."""
+
+        class _Engine:
+            def videos(self, query, **kwargs):
+                if "videos" in broken:
+                    raise RuntimeError("rate limited")
+                return list(videos or [])
+
+            def text(self, query, **kwargs):
+                if "text" in broken:
+                    raise RuntimeError("rate limited")
+                return list(texts or [])
+
+        # `_backend()` must yield the class itself -- that is the contract
+        # web_search already depends on -- so the factory returns the class
+        # rather than an instance of it.
+        return lambda: _Engine
+
+    real = (websearch._backend, websearch._youtube_watch)
+
+    # YouTube's own results page is asked first -- the one source that needs
+    # no third party to agree to being asked.
+    try:
+        websearch._youtube_watch = lambda q, t=10.0: (
+            "https://www.youtube.com/watch?v=first", "Top hit")
+        found = websearch.find_video("anything")
+        check("YouTube's own results beat any search backend",
+              bool(found) and found[0].endswith("=first"), repr(found))
+        websearch._youtube_watch = lambda *a, **k: None
+
+        websearch._backend = fake_backend(videos=[
+            {"href": "https://example.com/blog", "title": "A page"},
+            {"href": "https://www.youtube.com/watch?v=z", "title": "The Song"},
+        ])
+        found = websearch.find_video("the song")
+        check("a watch page beats a page that will not play",
+              found == ("https://www.youtube.com/watch?v=z", "The Song"), repr(found))
+
+        websearch._backend = fake_backend(videos=[
+            {"href": "https://www.youtube.com/watch?v=z", "title": "First"},
+            {"href": "https://www.youtube.com/watch?v=y", "title": "Second"},
+        ])
+        found = websearch.find_video("anything")
+        check("the first watch page is the one taken",
+              bool(found) and found[0].endswith("=z"), repr(found))
+
+        websearch._backend = fake_backend(
+            videos=[{"href": "https://vimeo.com/1", "title": "Elsewhere"}])
+        found = websearch.find_video("anything")
+        check("any video is taken when no watch page offered",
+              bool(found) and found[0] == "https://vimeo.com/1", repr(found))
+
+        websearch._backend = fake_backend(
+            videos=[],
+            texts=[{"href": "https://www.youtube.com/watch?v=q", "title": "Via text"}],
+        )
+        found = websearch.find_video("anything")
+        check("an empty video search falls through to a text search",
+              bool(found) and found[0].endswith("=q"), repr(found))
+
+        websearch._backend = fake_backend(broken=("videos", "text"))
+        check("no search backend at all finds nothing",
+              websearch.find_video("anything") is None,
+              repr(websearch.find_video("anything")))
+        check("an empty request finds nothing",
+              websearch.find_video("   ") is None, repr(websearch.find_video("   ")))
+
+        # The HTML half, exercised without a network: an id and its title
+        # are matched by where they sit, not by which one comes first.
+        page = (
+            '{"payload":{"videoId":"dQw4w9WgXcQ"}'
+            ',"list":[{"videoId":"dQw4w9WgXcQ",'
+            '"title":{"runs":[{"text":"Never Gonna Give You Up"}]}},'
+            '{"videoId":"abcdefghijk",'
+            '"title":{"runs":[{"text":"Some \\u0026 Other"}]}}]}'
+        )
+        found = websearch._watch_from(page)
+        check("reads a watch URL and its title out of the results HTML",
+              found == ("https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                        "Never Gonna Give You Up"), repr(found))
+
+        # An id with no title anywhere near it is a command payload rather
+        # than a result; the window is wider than the 6,000 characters a
+        # real page puts between such a payload and the next result's title.
+        strayed = '{"videoId":"aaaaaaaaaaa"' + "x" * 7000 + "}" \
+                  '{"videoId":"bbbbbbbbbbb","title":{"runs":[{"text":"Second"}]}}'
+        check("an id with no title beside it is passed over",
+              websearch._watch_from(strayed) ==
+              ("https://www.youtube.com/watch?v=bbbbbbbbbbb", "Second"),
+              repr(websearch._watch_from(strayed)))
+
+        check("titles keep their JSON escaping decoded",
+              websearch._watch_from(
+                  '{"videoId":"abcdefghijk","title":{"runs":'
+                  '[{"text":"A \\u0026 B"}]}}')[1] == "A & B",
+              repr(websearch._watch_from(
+                  '{"videoId":"abcdefghijk","title":{"runs":'
+                  '[{"text":"A \\u0026 B"}]}}')))
+
+        check("an id alone is still a playable answer",
+              websearch._watch_from('{"videoId":"abcdefghijk"}') ==
+              ("https://www.youtube.com/watch?v=abcdefghijk", ""),
+              repr(websearch._watch_from('{"videoId":"abcdefghijk"}')))
+
+        check("a page with nothing on it finds nothing",
+              websearch._watch_from("<html>no results</html>") is None,
+              repr(websearch._watch_from("<html>no results</html>")))
+        check("an empty page finds nothing",
+              websearch._watch_from("") is None, repr(websearch._watch_from("")))
+    finally:
+        websearch._backend, websearch._youtube_watch = real
 
 
 # --------------------------------------------------------------------------
@@ -805,6 +996,7 @@ def main() -> int:
         test_plain_math,
         test_stream_cut,
         test_computer_control,
+        test_video_search,
         test_speech_engines,
         test_vad,
         test_gate_multiplier,

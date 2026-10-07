@@ -10,12 +10,13 @@ Say **"Apache, …"** out loud, or just type. It answers with a voice.
 
 | Capability | How |
 |---|---|
-| **Tool-calling agent** | `langchain.agents.create_agent` with a calculator, Python sandbox, file tools, document search, web search, a clock, and `open_app` / `open_url` for starting programs and sites |
+| **Tool-calling agent** | `langchain.agents.create_agent` with a calculator, Python sandbox, file tools, document search, web search, a clock, `open_app` / `open_url` for starting programs and sites, and `play_media` for starting a song |
 | **Conversation memory** | LangGraph `MemorySaver` checkpointer, one thread per session |
 | **Chat with your documents (RAG)** | Upload text/PDF → chunked → `OllamaEmbeddings` + cosine retrieval, with an automatic TF-IDF fallback when no embedding model is pulled |
 | **Code interpreter sandbox** | `subprocess` running `python -I` with a timeout, no stdin and bounded output |
 | **Free talk (wake word optional)** | Continuous mic → energy VAD → speech-to-text → run the agent. Saying `"Apache"` still works and is stripped; tick **Require the wake word** if you want only commands after it |
 | **Voice output** | Offline Piper voice, autoplayed in the browser — every reply spoken, errors included, and speaking starts with the typing rather than after it |
+| **It plays, not just opens** | `play_media` resolves a song request to a watch page, which starts on its own; emoji never reach the synthesiser |
 | **Background tab** | Reaches the speaker with another tab in front (see *Design notes*) |
 | **Streaming** | Token-by-token replies plus a live tool-activity panel, with the voice following the text as it lands |
 | **Links open in Chrome** | `open_url` looks for Chrome before falling back to the system default; `APACHE_BROWSER` forces a choice |
@@ -143,7 +144,8 @@ Every setting can be overridden with an `APACHE_`-prefixed environment variable
 |---|---|---|
 | `APACHE_MODEL` | `qwen3:1.7b` | Ollama chat model |
 | `APACHE_OFFLINE` | `1` | Local speech engines; `0` switches to Google + edge-tts |
-| `APACHE_WHISPER_MODEL` | `base.en` | Local recogniser; `small.en` is more accurate, about twice as slow |
+| `APACHE_WHISPER_MODEL` | `small.en` | Local recogniser. `base.en` (~75 MB) is about twice as fast and noticeably worse; `medium.en` is better again and slow |
+| `APACHE_WHISPER_BEAM` | `5` | Decoding width. `1` is greedy and fastest, and hears short words badly; `5` is Whisper's own default |
 | `APACHE_PIPER_VOICE` | `models/piper/en_US-ryan-medium.onnx` | Local voice file for spoken replies |
 | `APACHE_TTS_RATE` | `+0%` | Pace of spoken replies; also sets Piper's length scale. `+10%` quicker, `-10%` more considered |
 | `APACHE_TTS_NOISE_SCALE` | `0.8` | Prosodic variation — lower is flatter, higher adds breath noise (Piper's own default is `0.667`) |
@@ -354,6 +356,48 @@ ask. Its opening paragraph now does — without quoting an example of the
 wrong reply, which the 1.7-billion-parameter model reproduced verbatim the
 first time it was tried.
 
+**Opening is not playing.** The apps opened and then sat there silent,
+which is the same complaint wearing a different hat: a search results page
+never starts on its own, so handing back one for a song request opens
+something and produces no sound at all. `play_media` therefore resolves the
+request first — `ddgs` video results, then a text search narrowed to YouTube
+when those come back empty — and returns the one watch page that autoplays,
+falling back to the results page only when nothing matched. Spotify is the
+honest exception: the desktop app can be *pointed* at a search through its
+`spotify:` handler, but pressing play there needs an account key this
+machine has not got, so the reply says the track still has to be picked
+rather than implying music had begun.
+
+**Only words reach the speaker.** A model closing a reply with a musical
+note puts an emoji in the transcript, and a synthesiser reads that code
+point aloud as though it spelled something. `clean_for_speech` now drops
+every Unicode "other symbol" together with the joiners, variation
+selectors and skin-tone modifiers that hold an emoji sequence together —
+as a space, so `song🎵great` reads as three words — and the prompt asks
+not to emit them in the first place. Currency signs are deliberately kept:
+they are *mathematical* symbols, and `$5` still has to read as money.
+
+**Hearing the right word.** The recogniser was `base.en` decoding greedily
+at beam width 1, and greedy decoding commits to a word on the first noisy
+frame — which is how "spotify" came back as "45". Both halves are fixed:
+`small.en` by default, downloading itself on first use (`APACHE_WHISPER_MODEL=base.en`
+puts the speed back), and beam width 5, Whisper's own default, which scores
+whole candidates before choosing and costs well under a second on a short
+utterance. Language is still pinned rather than detected, so a one-word
+clip is never mistaken for another one. Measured on clips Piper synthesized
+from four commands and read straight back, the old defaults got two of the
+four exactly right and mangled the rest (`Start Note Pass`, `Open you too`);
+the new ones get three, with `Open Spotify` — the complaint — clean.
+
+**A tool call written out is still a tool call.** The model sometimes
+formats a call itself: `play_media_tool` on one line, its arguments as JSON
+on the next, all of it arriving as ordinary text because the runtime had
+already decided it was prose. Left alone, Apache reads that aloud — every
+brace and quote spoken. `_run_text_tool_call` recognises the shape, runs
+the tool, and answers with its result, so a fumbled call still does the
+thing rather than narrating itself. The shape is specific enough that no
+sentence fits it by accident.
+
 **Pruning must not outrun playback.** The clip store keeps the newest twenty
 files, but the queue and the clip currently playing are exactly the files that
 must survive — trimming one of those deletes a reply that was written,
@@ -541,6 +585,8 @@ its own system applications — use the Windows Security toggle instead.
 | Documents answer weakly | `ollama pull nomic-embed-text`, then re-upload |
 | No wake word response | Check the **Voice** panel state; the mic may be muted, stopped, or have hit repeated STT failures. Note the wake word is **optional by default** — tick **Require the wake word** (or `APACHE_WAKE_REQUIRED=1`) only if you want it back |
 | `Speech recognition failed` repeatedly | The listener stops after 5 consecutive failures to avoid spinning; restart it with the mic button |
+| It hears the wrong word | The default is `small.en` at beam width 5. It downloads itself on first use (~466 MB, check `run.py --check`), and `APACHE_WHISPER_MODEL=base.en` trades accuracy back for speed. `APACHE_WHISPER_BEAM=1` does the same for decoding width |
+| It opens something and no sound follows | For a song or video use `play_media`, which resolves to a page that starts on its own — `open_url` only opens a page. For Spotify's own app a track cannot be started without an account key, so a search opens and one tap starts it |
 | No spoken replies | Untick **Speak replies aloud** only if you meant to. Otherwise run `run.py --check` and read the **Speech models** line — a missing Piper voice fails silently, and Apache looks perfectly healthy while saying nothing |
 | Nothing is spoken until I click something | Chrome blocks audio that starts without a gesture, and Apache's first words are the greeting. The page says so — **SOUND BLOCKED** across the top — until you click once, after which the origin is unlocked for good and every later reply plays on its own |
 | Replies stop arriving when I switch to another tab | Fixed in `app/ui.py::_page_js()` (see *Design notes*). If it still happens, check that a content blocker is not stripping the injected script |
