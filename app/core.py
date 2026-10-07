@@ -23,7 +23,7 @@ from typing import Any
 from .agent import AgentEvent, AgentRunner
 from .config import AUDIO, WORKSPACE, Settings, settings as default_settings
 from .rag import DocumentStore
-from .text import plain_math
+from .text import plain_math, stream_cut
 
 __all__ = ["Assistant", "Snapshot", "VoicePrompt"]
 
@@ -63,6 +63,11 @@ class Assistant:
         self._status = "Ready."
         self._busy = False
         self._turn = 0
+        #: How much of the reply in flight the voice has already been given.
+        #: Speech starts while the answer is still typing, so the synthesiser
+        #: must know where it stopped -- and, if an event replaces the text
+        #: under it, how much of what is on screen it has already said.
+        self._spoken = ""
         #: Set by the UI to abandon the turn in flight. Checked between agent
         #: events; the agent yields per token, so this takes effect in about
         #: one token rather than after the whole turn.
@@ -339,6 +344,7 @@ class Assistant:
             self._busy = True
             self._stop_requested = False
             self._turn += 1
+            self._spoken = ""
             self._history.append({"role": "user", "content": text})
             self._history.append({"role": "assistant", "content": ""})
             self._status = "Thinking..."
@@ -350,30 +356,30 @@ class Assistant:
         with self._lock:
             if event.kind == "text":
                 self._set_reply(event.text)
-                return True
-
-            if event.kind == "final":
+            elif event.kind == "final":
                 self._set_reply(event.text)
                 self._status = "Answered."
-                return True
-
-            if event.kind == "tool_call":
+            elif event.kind == "tool_call":
                 self._activity.append(f"→ {event.text}")
                 self._status = f"Using {event.text.split('(')[0]}..."
                 self._trim_activity()
-                return True
-
-            if event.kind == "tool":
+            elif event.kind == "tool":
                 self._activity.append(f"  {event.text}")
                 self._trim_activity()
-                return True
-
-            if event.kind == "error":
+            elif event.kind == "error":
                 self._set_reply(f"⚠ {event.text}")
                 self._status = "Error."
-                return True
+            else:
+                return False
 
-            return False
+        # Outside the lock, at the moment the text lands: speech has to begin
+        # with the typing, so it cannot wait behind a state update the UI is
+        # waiting for, and it cannot wait for the turn to end. Errors are
+        # spoken whole by _finish_turn instead -- a message that replaces the
+        # reply rather than extending it would be cut in the middle.
+        if event.kind in ("text", "final"):
+            self._stream_speech(flush=event.kind == "final")
+        return True
 
     def _set_reply(self, text: str) -> None:
         # Sanitised here so the transcript and the synthesiser see one text.
@@ -400,7 +406,10 @@ class Assistant:
         # rather than read aloud as nothing.
         if not self.speak_replies or not reply.strip():
             return
-        self._synthesize(reply)
+        # Only what is left: most of it was already queued while it was
+        # still being typed, and saying the whole thing a second time is
+        # worse than saying nothing.
+        self._stream_speech(flush=True)
 
     def _abort_turn(self, message: str) -> None:
         with self._lock:
@@ -408,6 +417,11 @@ class Assistant:
                 if not self._history[-1]["content"]:
                     self._history[-1]["content"] = f"⚠ {message}"
             self._status = message
+        # Speech now starts while the answer is still typing, so a stopped
+        # answer has clips queued behind it. They are the words the user just
+        # silenced, and leaving them there meant the stop was confirmed out
+        # loud by the rest of the reply they had cut off.
+        self._drop_unsaid_clips()
         # An interrupted turn used to end in silence, which is the least
         # helpful possible outcome: nothing on screen, nothing to hear.
         if message:
@@ -420,6 +434,69 @@ class Assistant:
     # ------------------------------------------------------------------
     # Voice output
     # ------------------------------------------------------------------
+    def _stream_speech(self, *, flush: bool = False) -> None:
+        """Hand the voice whatever of the reply has finished arriving.
+
+        The answer reaches the screen a token at a time, and the speaker used
+        to wait for all of it -- so a reply you could read was one you could
+        not yet hear. Each chunk complete enough to say is queued the moment
+        it lands, and because the queue plays clips in order the speaker
+        trails the transcript instead of racing it.
+
+        ``flush`` marks the end of the turn: whatever is still unsaid goes
+        out as it stands, sentence boundary or not.
+        """
+        if not self.speak_replies:
+            return
+
+        with self._lock:
+            if not self._history or self._history[-1]["role"] != "assistant":
+                return
+            text = self._history[-1]["content"]
+            # The reply normally only grows, so everything said is a prefix
+            # of it. plain_math rewriting a half-written formula is the
+            # exception; there the mark is held where it was rather than
+            # walked back, because repeating a sentence already heard is
+            # worse than losing one clause of it.
+            shared = min(len(self._spoken), len(text))
+            tail = text[shared:]
+            cut = len(tail) if flush else stream_cut(tail)
+            if cut <= 0:
+                return
+            chunk = tail[:cut].strip()
+            self._spoken = text[: shared + cut]
+
+        # Outside the lock: synthesis runs on its own thread, and this is
+        # called for every token that completes a sentence.
+        if chunk:
+            self._synthesize(chunk)
+
+    def _drop_unsaid_clips(self) -> None:
+        """Forget this turn's clips the browser has not been handed yet.
+
+        Speech beginning with the typing is what puts them there: stopping a
+        reply halfway leaves the rest of it queued. The clips are named for
+        the turn that asked for them, so this only ever reaches the ones the
+        current turn produced -- a greeting or an idle check-in already
+        waiting its turn is left alone.
+        """
+        with self._lock:
+            prefix = f"reply-{self._turn}-"
+            keep: list[tuple[str, float]] = []
+            dropped: list[str] = []
+            for path, duration in self._audio_queue:
+                if Path(path).name.startswith(prefix):
+                    dropped.append(path)
+                else:
+                    keep.append((path, duration))
+            self._audio_queue[:] = keep
+
+        for path in dropped:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:  # pragma: no cover - a file already gone
+                pass
+
     def _synthesize(self, reply: str) -> None:
         from .voice.tts import (
             TTSUnavailable,

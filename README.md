@@ -15,9 +15,10 @@ Say **"Apache, …"** out loud, or just type. It answers with a voice.
 | **Chat with your documents (RAG)** | Upload text/PDF → chunked → `OllamaEmbeddings` + cosine retrieval, with an automatic TF-IDF fallback when no embedding model is pulled |
 | **Code interpreter sandbox** | `subprocess` running `python -I` with a timeout, no stdin and bounded output |
 | **Free talk (wake word optional)** | Continuous mic → energy VAD → speech-to-text → run the agent. Saying `"Apache"` still works and is stripped; tick **Require the wake word** if you want only commands after it |
-| **Voice output** | Offline Piper voice, autoplayed in the browser — every reply spoken, errors included |
+| **Voice output** | Offline Piper voice, autoplayed in the browser — every reply spoken, errors included, and speaking starts with the typing rather than after it |
 | **Background tab** | Reaches the speaker with another tab in front (see *Design notes*) |
-| **Streaming** | Token-by-token replies plus a live tool-activity panel |
+| **Streaming** | Token-by-token replies plus a live tool-activity panel, with the voice following the text as it lands |
+| **Links open in Chrome** | `open_url` looks for Chrome before falling back to the system default; `APACHE_BROWSER` forces a choice |
 
 ---
 
@@ -60,22 +61,24 @@ python -m pip install -r requirements.txt
 
 Voice runs offline by default, so the two engines need their models on disk
 once per machine. Whisper downloads itself into `models/whisper` the first time
-it is asked for; the Piper voice is a direct download. `en_US-ryan-high` is the
-default — a larger model than the medium one it replaces, and the difference is
-the flatness that makes a synthesiser sound like a machine reading text:
+it is asked for; the Piper voice is a direct download. `en_US-ryan-medium` is
+the default:
 
 ```powershell
 New-Item -ItemType Directory -Force models\piper | Out-Null
 $base = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
-Invoke-WebRequest "$base/en/en_US/ryan/high/en_US-ryan-high.onnx" -OutFile models\piper\en_US-ryan-high.onnx
-Invoke-WebRequest "$base/en/en_US/ryan/high/en_US-ryan-high.onnx.json" -OutFile models\piper\en_US-ryan-high.onnx.json
+Invoke-WebRequest "$base/en/en_US/ryan/medium/en_US-ryan-medium.onnx" -OutFile models\piper\en_US-ryan-medium.onnx
+Invoke-WebRequest "$base/en/en_US/ryan/medium/en_US-ryan-medium.onnx.json" -OutFile models\piper\en_US-ryan-medium.onnx.json
 ```
 
 Any other voice on this machine works the same way — drop the `.onnx` and its
 `.onnx.json` beside it and it appears in the **Voice** tab, where choosing it
-takes effect on the next reply:
+takes effect on the next reply. `en_US-ryan-high` is a second, larger Ryan if
+you would rather hear that one:
 
 ```powershell
+Invoke-WebRequest "$base/en/en_US/ryan/high/en_US-ryan-high.onnx" -OutFile models\piper\en_US-ryan-high.onnx
+Invoke-WebRequest "$base/en/en_US/ryan/high/en_US-ryan-high.onnx.json" -OutFile models\piper\en_US-ryan-high.onnx.json
 Invoke-WebRequest "$base/en/en_US/lessac/medium/en_US-lessac-medium.onnx" -OutFile models\piper\en_US-lessac-medium.onnx
 Invoke-WebRequest "$base/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json" -OutFile models\piper\en_US-lessac-medium.onnx.json
 ```
@@ -141,7 +144,7 @@ Every setting can be overridden with an `APACHE_`-prefixed environment variable
 | `APACHE_MODEL` | `qwen3:1.7b` | Ollama chat model |
 | `APACHE_OFFLINE` | `1` | Local speech engines; `0` switches to Google + edge-tts |
 | `APACHE_WHISPER_MODEL` | `base.en` | Local recogniser; `small.en` is more accurate, about twice as slow |
-| `APACHE_PIPER_VOICE` | `models/piper/en_US-ryan-high.onnx` | Local voice file for spoken replies |
+| `APACHE_PIPER_VOICE` | `models/piper/en_US-ryan-medium.onnx` | Local voice file for spoken replies |
 | `APACHE_TTS_RATE` | `+0%` | Pace of spoken replies; also sets Piper's length scale. `+10%` quicker, `-10%` more considered |
 | `APACHE_TTS_NOISE_SCALE` | `0.8` | Prosodic variation — lower is flatter, higher adds breath noise (Piper's own default is `0.667`) |
 | `APACHE_MIC_AUTOSTART` | `1` | Open the microphone as soon as the page opens |
@@ -163,6 +166,7 @@ Every setting can be overridden with an `APACHE_`-prefixed environment variable
 | `APACHE_VAD_PRE_ROLL_MS` | `150` | Room tone kept before the first word |
 | `APACHE_VAD_KEEP_TAIL_MS` | `300` | Silence kept after the last word |
 | `APACHE_SANDBOX_TIMEOUT` | `20` | Seconds a `run_python` call may run |
+| `APACHE_BROWSER` | *(Chrome, then the default)* | Executable used to open links; set it to force a specific browser |
 | `APACHE_SYSTEM_PROMPT` | *(built in)* | Overrides the system prompt |
 
 The wake word also accepts a few aliases (`a patch`, `a path`, `app patch`)
@@ -304,9 +308,34 @@ three of them all present as "Apache is not talking". `_page_js()` in
    late.
 3. *Chrome blocks media that starts without a user gesture*, and Apache's
    first words are the greeting, spoken before anyone has clicked anything —
-   which is the whole point of a voice assistant. One inaudible buffer on the
-   first interaction unlocks the origin for good; any reply the browser had
-   rejected is retried every second until it plays.
+   which is the whole point of a voice assistant. The refusal is caught where
+   it happens: `play()` is wrapped, so an element that rejects is recorded
+   wherever it lives — including the detached one WaveSurfer plays through,
+   which the old `document.getElementsByTagName("audio")` scan could never
+   see — and retried once a second, with any Web Audio context resumed
+   alongside it. Until that first click, a banner across the top of the page
+   says **SOUND BLOCKED** rather than leaving an apparently healthy Apache
+   silently mute.
+
+**The answer speaks while it is still being written.** The reply reaches the
+screen a token at a time, and the speaker used to wait for all of it — so a
+reply you could read was one you could not yet hear. Each chunk complete
+enough to say is handed to the synthesiser as soon as it arrives, and since
+the queue plays clips in order the voice trails the transcript instead of
+racing it. `stream_cut()` in `app/text.py` decides where a chunk may end: at
+a sentence or a line break, never inside an open code fence, never in the
+middle of `3.14` or `e.g.`, and — when a reply runs long without any
+punctuation at all — at the last space once there is enough to be worth
+saying. The tail is spoken when the answer ends, and stopping a reply halfway
+takes the rest of it with it: the clips still queued are the words the user
+just silenced.
+
+**Links open in Chrome.** `open_url` asks `browser_for_urls()` for an
+executable first — `APACHE_BROWSER` if it is set, then Chrome found in the
+registry under `App Paths`, then the three places it is normally installed —
+so "open YouTube" does not land in whatever browser happens to be the
+default. On this machine that default is Edge. The system's own browser is
+the fallback when there is no Chrome to be found.
 
 **Pruning must not outrun playback.** The clip store keeps the newest twenty
 files, but the queue and the clip currently playing are exactly the files that
@@ -494,7 +523,7 @@ its own system applications — use the Windows Security toggle instead.
 | No wake word response | Check the **Voice** panel state; the mic may be muted, stopped, or have hit repeated STT failures. Note the wake word is **optional by default** — tick **Require the wake word** (or `APACHE_WAKE_REQUIRED=1`) only if you want it back |
 | `Speech recognition failed` repeatedly | The listener stops after 5 consecutive failures to avoid spinning; restart it with the mic button |
 | No spoken replies | Untick **Speak replies aloud** only if you meant to. Otherwise run `run.py --check` and read the **Speech models** line — a missing Piper voice fails silently, and Apache looks perfectly healthy while saying nothing |
-| Nothing is spoken until I click something | Chrome blocks audio that starts without a gesture, and Apache's first words are the greeting. Click the page once — after that the origin is unlocked for good and every later reply plays on its own |
+| Nothing is spoken until I click something | Chrome blocks audio that starts without a gesture, and Apache's first words are the greeting. The page says so — **SOUND BLOCKED** across the top — until you click once, after which the origin is unlocked for good and every later reply plays on its own |
 | Replies stop arriving when I switch to another tab | Fixed in `app/ui.py::_page_js()` (see *Design notes*). If it still happens, check that a content blocker is not stripping the injected script |
 | Microphone never starts by itself | `APACHE_MIC_AUTOSTART=1` is the default; the **Voice** panel reports a device that refused to open |
 | Voice input is slow or stops after a burst | That was Google throttling recognitions. Offline mode (`APACHE_OFFLINE=1`) has no endpoint to throttle |

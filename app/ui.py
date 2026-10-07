@@ -478,6 +478,35 @@ html, body {
 .gradio-container .footer {
     color: #4d6b80 !important;
 }
+
+/* --- 10. The one click Chrome will not do without -------------------------- */
+/* Chrome refuses to start audio until the page has seen a gesture, and
+   Apache's first words arrive before anyone has clicked anything. Saying so
+   turns silence with no explanation into one obvious click. */
+#apache-sound-prompt {
+    position: fixed;
+    top: 14px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 999;
+    padding: 9px 18px;
+    background: rgba(5, 10, 18, .96);
+    border: 1px solid rgba(0, 229, 255, .55);
+    color: #a8f4ff;
+    font-family: var(--font-mono);
+    font-size: .74rem;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    box-shadow:
+        0 0 22px rgba(0, 229, 255, .30),
+        inset 0 0 14px rgba(0, 229, 255, .08);
+    animation: apache-prompt 1.6s ease-in-out infinite;
+    cursor: pointer;
+}
+@keyframes apache-prompt {
+    0%, 100% { box-shadow: 0 0 14px rgba(0, 229, 255, .22); }
+    50%      { box-shadow: 0 0 34px rgba(0, 229, 255, .55); }
+}
 """
 
 
@@ -557,9 +586,12 @@ def _page_js() -> str:
        playing audio. The keep-alive loop buys that exemption.
     3. **Chrome blocks media that starts without a user gesture**, and
        Apache's first words are the greeting, spoken before anyone has
-       clicked anything, because the whole point is that you talk to it. One
-       inaudible buffer on the first interaction unlocks the origin; replies
-       the browser rejected are retried on every tick.
+       clicked anything, because the whole point is that you talk to it. The
+       refusal has to be caught where it happens -- on the player itself,
+       which is detached from the document and invisible to a DOM scan -- and
+       retried, in order, once a gesture unlocks the origin. Until then the
+       page says so, because silence with no explanation is the one failure
+       the user cannot diagnose for themselves.
     """
     wav = _keepalive_wav()
     return """
@@ -567,6 +599,15 @@ def _page_js() -> str:
   "use strict";
 
   var keepAliveWav = "%s";
+
+  /* Every piece of sound state, declared before anything can use it: the
+     keep-alive is refused play() during construction of this very block. */
+  var keepAlive = null;
+  var promptEl = null;
+  var unlocked = false;
+  var blockedSound = false;
+  var refused = [];   // clips the browser turned away, oldest first
+  var contexts = [];  // Web Audio contexts, in case a player uses one
 
   /* --- 1. Keep the ticker running while another tab is in front --------- */
   try {
@@ -584,7 +625,6 @@ def _page_js() -> str:
   }
 
   /* --- 2. Stay exempt from Chrome's background-timer throttling --------- */
-  var keepAlive = null;
   function ensureKeepAlive() {
     try {
       if (!keepAlive) {
@@ -606,27 +646,97 @@ def _page_js() -> str:
     }
   }
 
-  /* --- 3. Unlock autoplay, and retry a reply it rejected ---------------- */
-  function retryBlockedReplies() {
-    try {
-      var players = document.getElementsByTagName("audio");
-      for (var i = 0; i < players.length; i++) {
-        var el = players[i];
-        if (el === keepAlive || !el.paused || el.ended) continue;
-        if (!el.currentSrc) continue;
-        // Only a clip that has not started: one already played, or finished,
-        // must never be restarted by this watchdog.
-        if (el.currentTime > 0.05) continue;
-        var attempt = el.play();
-        if (attempt && attempt.catch) { attempt.catch(function () {}); }
-      }
-    } catch (err) { /* the DOM changed under us; next tick retries */ }
+  /* --- 3. Catch every play() the browser turns away -------------------- */
+  // The element that actually speaks is not in the document. Gradio plays
+  // through WaveSurfer, which owns a detached <audio> of its own, so a scan
+  // of document.getElementsByTagName("audio") sees only the hidden native
+  // element -- which carries no src -- plus the keep-alive above, and never
+  // the reply. Wrapping play() is the only thing that can name that element
+  // wherever it lives, so the refusal is recorded at the source.
+  function noteRefusal(el) {
+    if (!el) return;
+    blockedSound = true;
+    if (!unlocked) showPrompt();
+    if (el === keepAlive) return;  // the keep-alive retries itself
+    if (refused.indexOf(el) === -1) refused.push(el);
   }
 
-  var unlocked = false;
+  try {
+    var realPlay = HTMLMediaElement.prototype.play;
+    HTMLMediaElement.prototype.play = function () {
+      var attempt;
+      try {
+        attempt = realPlay.apply(this, arguments);
+      } catch (err) {
+        noteRefusal(this);
+        throw err;
+      }
+      if (attempt && attempt.then) {
+        var media = this;
+        attempt.catch(function () { noteRefusal(media); });
+      }
+      return attempt;
+    };
+  } catch (err) { /* an engine that refuses the wrap plays the ordinary way */ }
+
+  // A Web Audio player is silent for a subtler reason: its context is created
+  // while the page is still untrusted, stays suspended until a gesture, and
+  // only its owner can resume it. Keeping the list is what lets a later
+  // gesture do that -- Apache's own context cannot resume someone else's.
+  try {
+    var RealContext = window.AudioContext || window.webkitAudioContext;
+    if (RealContext) {
+      var TrackedContext = function () {
+        var ctx = Reflect.construct(RealContext, arguments, RealContext);
+        contexts.push(ctx);
+        return ctx;
+      };
+      TrackedContext.prototype = RealContext.prototype;
+      window.AudioContext = TrackedContext;
+      if (window.webkitAudioContext) window.webkitAudioContext = TrackedContext;
+    }
+  } catch (err) { /* tracking is lost; playback itself is untouched */ }
+
+  /* --- 4. Say the clips in the order they were refused ------------------ */
+  function retryBlockedReplies() {
+    while (refused.length) {
+      var el = refused[0];
+      // Finished, sourceless or gone: nothing left to say, move on.
+      if (!el || el.ended || !el.src) { refused.shift(); continue; }
+      // Speaking: the server has already spaced these by duration, so the
+      // next one waits rather than talking over this one.
+      if (!el.paused) return;
+      try {
+        var attempt = el.play();
+        if (attempt && attempt.catch) { attempt.catch(function () {}); }
+      } catch (err) { /* the next tick tries again */ }
+      return; // whether it took is settled on the next pass
+    }
+  }
+
+  /* --- 5. The one click Chrome insists on -------------------------------- */
+  function showPrompt() {
+    if (promptEl || unlocked) return;
+    try {
+      promptEl = document.createElement("div");
+      promptEl.id = "apache-sound-prompt";
+      promptEl.textContent = "SOUND BLOCKED \\u2014 click anywhere to hear Apache";
+      document.body.appendChild(promptEl);
+    } catch (err) {
+      promptEl = null;  // no body yet; the next refusal tries again
+    }
+  }
+
+  function hidePrompt() {
+    if (!promptEl) return;
+    try { promptEl.parentNode.removeChild(promptEl); } catch (err) {}
+    promptEl = null;
+  }
+
   function unlock() {
     if (unlocked) return;
     unlocked = true;
+    hidePrompt();
     try {
       var Context = window.AudioContext || window.webkitAudioContext;
       var ctx = new Context();
@@ -638,6 +748,14 @@ def _page_js() -> str:
       if (ctx.state === "suspended" && ctx.resume) ctx.resume();
       window.apacheAudioContext = ctx;
     } catch (err) { /* the next gesture tries again */ }
+    // Resume every context this page made while it was still untrusted.
+    for (var i = 0; i < contexts.length; i++) {
+      try {
+        if (contexts[i].state === "suspended" && contexts[i].resume) {
+          contexts[i].resume();
+        }
+      } catch (err) { /* a closed context is not ours to revive */ }
+    }
     ensureKeepAlive();
     retryBlockedReplies();
   }
@@ -649,7 +767,8 @@ def _page_js() -> str:
   setInterval(function () {
     ensureKeepAlive();
     retryBlockedReplies();
-  }, 1000);
+    if (blockedSound && !unlocked) showPrompt();
+  }, 500);
 })();
 """ % wav
 

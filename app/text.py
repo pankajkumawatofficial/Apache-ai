@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["plain_math"]
+__all__ = ["plain_math", "stream_cut"]
 
 #: LaTeX a small model emits anyway, with the words it should become. A bare
 #: command is worse than missing information because the synthesiser spells it
@@ -100,3 +100,77 @@ def plain_math(text: str) -> str:
     for i in range(0, len(parts), 2):
         parts[i] = prose(parts[i])
     return "".join(parts)
+
+
+#: Characters that mean something has been said whole. A newline counts
+#: because a reply's paragraphs and list items arrive line by line, and
+#: waiting for a full stop inside a bulleted list would hold the first item
+#: until the last one landed.
+_SENTENCE_END = ".!?…\n"
+
+#: Without any punctuation at all -- a model writing one long sentence, or
+#: a run of technical text -- the speaker waits no longer than this before
+#: cutting at the last space it passed, so a paragraph still reaches the
+#: ear while it is still being written.
+_STREAM_LIMIT = 140
+#: The shortest cut worth making at a space. Without a floor, "the" would
+#: be handed over as its own clip, one word at a time.
+_STREAM_FLOOR = 60
+
+
+def _is_boundary(text: str, index: int) -> bool:
+    """Is the punctuation at *index* the end of something said whole?"""
+    char = text[index]
+    # A line break ends a line by whatever follows it -- "- one\n- two" is
+    # two lines, and waiting for a full stop would hold the first until the
+    # last. "!?…" end a sentence on their own too.
+    if char != ".":
+        return True
+    after = text[index + 1 : index + 2]
+    # "3.14", "v2.0", "run.py": a full stop followed by more of the same
+    # token belongs to the token, not to the sentence.
+    if after and not after.isspace():
+        return False
+    head = text[:index].rsplit(None, 1)
+    token = head[-1].lstrip("(\"'") if head else ""
+    letters = token.replace(".", "")
+    # "e.g.", "i.e.", "U.S.": a full stop after one or two letters ends an
+    # abbreviation, and the sentence it sits in is still coming.
+    return not (0 < len(letters) <= 2 and letters.isalpha())
+
+
+def stream_cut(text: str) -> int:
+    """How much of *text* is complete enough to be said out loud now.
+
+    A reply arrives a token at a time, and the voice is asked for a chunk as
+    soon as one is ready rather than at the end: half a sentence, an open
+    code fence or a truncated link all read as nonsense through a speaker.
+    This returns the length of the leading run that ends on a sentence
+    boundary, and 0 while there is nothing safe to say yet -- so the caller
+    can speak the front of the reply and hold the rest back for the next
+    call, without either of them guessing where a thought stops.
+    """
+    if not text:
+        return 0
+
+    # Never stop inside a code fence. An unclosed one is a half-finished
+    # block the model is still writing, and cutting there would read out a
+    # fragment of code as if it were prose.
+    if text.count("```") % 2:
+        opener = text.find("```")
+        if opener <= 0:
+            return 0
+        text = text[:opener]
+
+    cut = 0
+    for i, char in enumerate(text):
+        if char in _SENTENCE_END and _is_boundary(text, i):
+            cut = i + 1
+    if cut:
+        return cut
+
+    if len(text) >= _STREAM_LIMIT:
+        cut = text.rfind(" ", _STREAM_FLOOR, len(text))
+        if cut > 0:
+            return cut + 1
+    return 0

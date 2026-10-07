@@ -179,12 +179,12 @@ class Settings:
     # CPU; "small.en" is more accurate and roughly twice as slow.
     whisper_model: str = _env("WHISPER_MODEL", "base.en")
     whisper_dir: Path = Path(_env("WHISPER_DIR", str(MODELS / "whisper")))
-    # A Piper .onnx file with its .onnx.json sitting beside it. "high" is a
-    # larger model than the medium one it replaces, and the difference is the
-    # flatness that makes a synthesiser sound like a machine reading text.
-    # Other downloaded voices can be picked in the Voice tab.
+    # A Piper .onnx file with its .onnx.json sitting beside it. The default is
+    # the medium Ryan; en_US-ryan-high sits beside it as the larger of the two
+    # on disk, and the Voice tab switches between them -- or any other
+    # downloaded voice -- without a restart.
     piper_voice: str = _env(
-        "PIPER_VOICE", str(MODELS / "piper" / "en_US-ryan-high.onnx")
+        "PIPER_VOICE", str(MODELS / "piper" / "en_US-ryan-medium.onnx")
     )
 
     # --- presence ---------------------------------------------------------

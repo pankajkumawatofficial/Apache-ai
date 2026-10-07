@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import settings                                        # noqa: E402
-from app.text import plain_math                                        # noqa: E402
+from app.text import plain_math, stream_cut                             # noqa: E402
 from app.tools.calculator import CalcError, safe_eval          # noqa: E402
 from app.tools.control import (                               # noqa: E402
     ControlError,
@@ -277,23 +277,111 @@ def test_plain_math() -> None:
           "`\\t`" in got and "$" not in got, repr(got))
 
 
+def test_stream_cut() -> None:
+    print("speech keeps pace with the typing")
+    # The point of the exercise: a reply arrives a token at a time and the
+    # speaker must be handed a whole thought, not the half of one that has
+    # happened to arrive.
+    cut = stream_cut("Hello Boss. What")
+    check("a finished sentence is cut whole",
+          cut == len("Hello Boss."), cut)
+
+    check("half a sentence waits", stream_cut("Hello Bo") == 0,
+          stream_cut("Hello Bo"))
+    check("empty text is not a chunk", stream_cut("") == 0, repr(stream_cut("")))
+
+    # Reaching a full stop that belongs to a token would cut the answer in
+    # the middle of a word it was about to say.
+    check("a decimal number is not an ending",
+          stream_cut("The answer is 3.14 and") == 0,
+          stream_cut("The answer is 3.14 and"))
+    check("an abbreviation is not an ending",
+          stream_cut("Use e.g. this one") == 0,
+          stream_cut("Use e.g. this one"))
+    check("but a sentence ending in one is",
+          stream_cut("Try e.g. this. Then") == len("Try e.g. this."),
+          stream_cut("Try e.g. this. Then"))
+
+    # A paragraph break is as good an ending as a full stop: a bulleted
+    # list would otherwise hold its first item until its last.
+    listed = "- open the file\n- save it\nand"
+    check("a line break ends a chunk",
+          stream_cut(listed) == len("- open the file\n- save it\n"),
+          stream_cut(listed))
+
+    # Nothing has finished a sentence and the text runs long: start talking
+    # rather than hold the first word until the whole paragraph lands.
+    rambling = "one " * 60
+    loose = stream_cut(rambling)
+    check("an unpunctuated run is still cut",
+          loose >= 60 and rambling[loose - 1] == " ", (loose, rambling[loose - 1:loose + 1]))
+    check("but only once it is worth a cut", stream_cut("just some words") == 0,
+          stream_cut("just some words"))
+
+    # Stopping inside a code fence would read a fragment of code as prose.
+    check("an open fence stops the cut", stream_cut("Run this: ```py") == 0,
+          stream_cut("Run this: ```py"))
+    check("the prose before it still goes",
+          stream_cut("Run this first. ```py") == len("Run this first."),
+          stream_cut("Run this first. ```py"))
+    closed = "Use this. ```py\nprint(1)\n``` Then that."
+    check("a closed fence is no longer a wall",
+          stream_cut(closed) == len(closed), stream_cut(closed))
+
+
 def test_computer_control() -> None:
     print("computer control")
+    import os
     import shutil
 
     from app.tools import control
 
     # Nothing here may open a real window on the developer's desktop: the
-    # launcher is the single seam control.py exposes, so replacing it is enough.
+    # launcher and the browser process are the only seams control.py
+    # exposes, so replacing both is enough -- Chrome is installed on this
+    # machine and the first open_url would otherwise start it for real.
     launched: list[object] = []
-    original = control._launch
+    spawned: list[list[str]] = []
+    real_browser_for_urls = control.browser_for_urls
+    originals = (control._launch, control._spawn, control.browser_for_urls)
     control._launch = launched.append
+    control._spawn = spawned.append
+    control.browser_for_urls = lambda: None
     workspace = Path(tempfile.mkdtemp()).resolve()
 
     try:
         control.open_url("youtube.com")
         check("adds the missing scheme",
               launched[-1] == "https://youtube.com", repr(launched[-1]))
+
+        # Windows gives a URL to the default browser, which on this machine
+        # is Edge -- so "open YouTube" arrived somewhere nobody was looking.
+        control.browser_for_urls = (
+            lambda: r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        )
+        control.open_url("youtube.com")
+        started = spawned[-1] if spawned else []
+        check("a link goes to Chrome rather than the default browser",
+              started == [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                          "https://youtube.com"],
+              repr(started or "NOT STARTED"))
+        check("Chrome takes the link, the default handler does not",
+              len(launched) == 1, repr(launched))
+
+        os.environ["APACHE_BROWSER"] = r"D:\Browsers\brave.exe"
+        try:
+            check("APACHE_BROWSER names a different browser",
+                  real_browser_for_urls() == r"D:\Browsers\brave.exe",
+                  repr(real_browser_for_urls()))
+        finally:
+            os.environ.pop("APACHE_BROWSER", None)
+        control.browser_for_urls = lambda: None
+
+        check("with no browser found the default handler still works",
+              launched[-1] == "https://youtube.com", repr(launched[-1]))
+        chosen = real_browser_for_urls()
+        check("a browser it names actually exists",
+              chosen is None or Path(chosen).exists(), repr(chosen))
 
         control.open_url("https://example.com/a?b=1")
         check("keeps a full address",
@@ -349,7 +437,7 @@ def test_computer_control() -> None:
               str(workspace / "docs") in [str(x) for x in launched],
               repr(launched[-3:]))
     finally:
-        control._launch = original
+        control._launch, control._spawn, control.browser_for_urls = originals
         shutil.rmtree(workspace, ignore_errors=True)
 
 
@@ -636,6 +724,7 @@ def main() -> int:
         test_wake_word,
         test_speech_cleanup,
         test_plain_math,
+        test_stream_cut,
         test_computer_control,
         test_speech_engines,
         test_vad,

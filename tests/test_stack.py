@@ -759,6 +759,20 @@ def test_background_tab() -> None:
           "pointerdown" in js and "unlock" in js, "missing")
     check("a reply the browser rejected is retried",
           "retryBlockedReplies" in js, "missing")
+    # The player that speaks is a detached element Gradio's waveform owns, so
+    # no scan of the document can ever see it -- the refusal has to be caught
+    # on play() itself, which is the one call every player has to make.
+    check("the refusal is caught where it happens",
+          "HTMLMediaElement.prototype.play" in js, "missing")
+    check("the scan that could never see the player is gone",
+          "currentSrc" not in js, "still scanning the DOM")
+    check("clips are said in order, one at a time",
+          "refused.indexOf" in js and "if (!el.paused) return" in js,
+          "missing")
+    check("the page says why nothing is audible",
+          "apache-sound-prompt" in js, "missing")
+    check("a Web Audio context is resumed as well",
+          "Reflect.construct" in js and ".resume()" in js, "missing")
     # The % formatting that embeds the WAV must have run: a leftover
     # placeholder would inject the literal "%s" into the page.
     check("no unsubstituted placeholder left", "%s" not in js, "found one")
@@ -808,6 +822,10 @@ def test_errors_are_spoken() -> None:
               repr(assistant.snapshot()[0][-1]["content"]))
 
         spoken.clear()
+        # A turn is begin/apply/finish; the flag is released between them by
+        # submit(). Without it the second turn would be refused and this
+        # check would be reading the error it is meant to be away from.
+        assistant._release()
         assistant._begin_turn("what is the capital of france")
         assistant._apply(AgentEvent("final", "Paris."))
         assistant._finish_turn()
@@ -815,6 +833,7 @@ def test_errors_are_spoken() -> None:
 
         assistant.speak_replies = False
         spoken.clear()
+        assistant._release()
         assistant._begin_turn("and again")
         assistant._apply(AgentEvent("final", "Paris."))
         assistant._finish_turn()
@@ -827,6 +846,80 @@ def test_errors_are_spoken() -> None:
         assistant._release()
         with assistant._lock:
             assistant._history[:] = saved_history
+
+
+def test_speech_keeps_pace() -> None:
+    """Speech starts with the typing, not after it has finished.
+
+    The answer reaches the screen a token at a time, and the speaker used to
+    wait for all of it -- so a reply you could read was one you could not yet
+    hear. Stopping one halfway has to take the rest of it with it, or the
+    words the user silenced are the ones that carry on speaking.
+    """
+    get_assistant, _, _, _ = _load_stack()
+    assistant = get_assistant()
+
+    from app.agent import AgentEvent
+
+    assistant._release()
+    with assistant._lock:
+        saved_history = list(assistant._history)
+        assistant._history.clear()
+
+    spoken: list[str] = []
+    original = assistant._synthesize
+    assistant._synthesize = lambda text: spoken.append(text)  # type: ignore[method-assign]
+    scratch = Path(tempfile.mkdtemp(prefix="apache-stream-"))
+    try:
+        assistant._begin_turn("tell me something long")
+        assistant._apply(AgentEvent("text", "First sentence lands here. Second"))
+        check("speech starts before the turn has ended",
+              spoken == ["First sentence lands here."], repr(spoken))
+
+        assistant._apply(AgentEvent(
+            "text", "First sentence lands here. Second one is still going"))
+        check("an unfinished sentence waits its turn",
+              len(spoken) == 1, repr(spoken))
+
+        assistant._finish_turn()
+        check("the tail is said when the answer ends",
+              spoken == ["First sentence lands here.",
+                         "Second one is still going"],
+              repr(spoken))
+        check("and nothing is said twice", len(spoken) == 2, repr(spoken))
+
+        assistant._release()
+        spoken.clear()
+        assistant._begin_turn("stop me halfway")
+        assistant._apply(AgentEvent("text", "One sentence here. Two"))
+        mine = scratch / f"reply-{assistant._turn}-deadbeef.wav"
+        mine.write_bytes(b"RIFF")
+        theirs = scratch / "reply-0-greeting.wav"
+        theirs.write_bytes(b"RIFF")
+        with assistant._lock:
+            assistant._audio_queue.append((str(mine), 1.0))
+            assistant._audio_queue.append((str(theirs), 1.0))
+        assistant._abort_turn("Stopped.")
+        time.sleep(0.3)
+        check("stopping drops the reply's unsaid clips", not mine.exists(),
+              str(mine))
+        check("and leaves a greeting waiting its turn alone",
+              theirs.exists(), str(theirs))
+        check("the stop itself is still announced",
+              "Stopped." in spoken, repr(spoken))
+    finally:
+        assistant._synthesize = original  # type: ignore[method-assign]
+        assistant._release()
+        with assistant._lock:
+            assistant._history[:] = saved_history
+            assistant._audio_queue = [
+                (path, dur)
+                for path, dur in assistant._audio_queue
+                if not path.startswith(str(scratch))
+            ]
+        for leftover in scratch.glob("*"):
+            leftover.unlink(missing_ok=True)
+        scratch.rmdir()
 
 
 def test_presence_prompts() -> None:
@@ -945,6 +1038,7 @@ def main() -> int:
         test_voice_defaults,
         test_background_tab,
         test_errors_are_spoken,
+        test_speech_keeps_pace,
         test_presence_prompts,
         # Kept last: it resets the shared conversation.
         test_stop_path,
