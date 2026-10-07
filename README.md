@@ -142,7 +142,7 @@ Every setting can be overridden with an `APACHE_`-prefixed environment variable
 | `APACHE_OFFLINE` | `1` | Local speech engines; `0` switches to Google + edge-tts |
 | `APACHE_WHISPER_MODEL` | `base.en` | Local recogniser; `small.en` is more accurate, about twice as slow |
 | `APACHE_PIPER_VOICE` | `models/piper/en_US-ryan-high.onnx` | Local voice file for spoken replies |
-| `APACHE_TTS_RATE` | `+10%` | Pace of spoken replies; also sets Piper's length scale |
+| `APACHE_TTS_RATE` | `+0%` | Pace of spoken replies; also sets Piper's length scale. `+10%` quicker, `-10%` more considered |
 | `APACHE_TTS_NOISE_SCALE` | `0.8` | Prosodic variation — lower is flatter, higher adds breath noise (Piper's own default is `0.667`) |
 | `APACHE_MIC_AUTOSTART` | `1` | Open the microphone as soon as the page opens |
 | `APACHE_WAKE_REQUIRED` | `0` | `1` goes back to waiting for the wake word before every command |

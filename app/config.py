@@ -149,9 +149,11 @@ class Settings:
     vad_keep_tail_ms: int = _env_int("VAD_KEEP_TAIL_MS", 300)
     stt_language: str = _env("STT_LANGUAGE", "en-US")
     tts_voice: str = _env("TTS_VOICE", "en-US-AndrewMultilingualNeural")
-    # A brisk, human pace rather than a read-out one. Piper's length scale is
-    # derived from this (see tts._length_scale), so it applies offline too.
-    tts_rate: str = _env("TTS_RATE", "+10%")
+    # The pace is left at the model's own declared default (its .onnx.json
+    # says length_scale: 1) -- a synthesiser is never made more human by
+    # being rushed, and Piper already speaks briskly. Set APACHE_TTS_RATE=+10%
+    # for quicker, APACHE_TTS_RATE=-10% for a more considered delivery.
+    tts_rate: str = _env("TTS_RATE", "+0%")
     # How much prosodic variation the synthesiser is allowed. Higher sounds
     # more alive and less like a machine reading text; too high adds breath
     # noise. Piper's own default is 0.667.
