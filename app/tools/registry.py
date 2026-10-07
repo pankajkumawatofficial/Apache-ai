@@ -18,7 +18,7 @@ from typing import Any
 from ..config import Settings, settings as default_settings
 from ..rag import DocumentStore, format_hits
 from .calculator import CalcError, safe_eval
-from .control import ControlError, open_file, open_url
+from .control import ControlError, open_app, open_file, open_url
 from .files import FileAccessError, list_files, read_file, write_file
 from .sandbox import run_python
 
@@ -146,14 +146,37 @@ def build_tools(
 
     @tool
     def open_url_tool(url: str) -> str:
-        """Open a web page in the default browser.
+        """Open a website in the browser.
 
-        Use this whenever the user wants to watch or read something online:
-        "open YouTube", "go to gmail", "open github.com". Pass the address;
-        https:// is added when it is missing. Only http and https are opened.
+        Use this when the user wants to watch or read something online:
+        "open YouTube", "go to gmail", "open github.com". Pass the address
+        or just the site's name -- a known service is recognised by name
+        and a bare host gets https:// added. Only http and https open.
+
+        To start a program installed on this computer, use open_app
+        instead; this one is for pages, not applications.
         """
         try:
             return open_url(url)
+        except ControlError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def open_app_tool(name: str) -> str:
+        """Launch a program installed on this computer.
+
+        Use this whenever the user asks to open, start or launch an
+        application: "open Spotify", "start Notepad", "launch Calculator".
+        Pass the program's name -- matching ignores case and most of the
+        wording, so "chrome" finds Google Chrome. When nothing of that name
+        is installed, the service's own website opens instead, so a name
+        that turns out to be a site still works.
+
+        This is the tool for "open <something>"; open_url is for a specific
+        page the user wants to read.
+        """
+        try:
+            return open_app(name)
         except ControlError as exc:
             return f"Error: {exc}"
 
@@ -180,6 +203,7 @@ def build_tools(
         search_documents,
         current_datetime,
         open_url_tool,
+        open_app_tool,
         open_file_tool,
     ]
 

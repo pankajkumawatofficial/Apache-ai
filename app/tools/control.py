@@ -20,6 +20,7 @@ from pathlib import Path
 __all__ = [
     "ControlError",
     "is_launcher_available",
+    "open_app",
     "open_file",
     "open_folder",
     "open_url",
@@ -31,6 +32,59 @@ __all__ = [
 _EXECUTABLE_SUFFIXES = frozenset(
     {".exe", ".com", ".bat", ".cmd", ".ps1", ".psm1", ".msi", ".scr", ".vbs", ".jar"}
 )
+
+#: Where a program announces itself. One registry read rather than a walk of
+#: the disk, and the place classic installers register under.
+_APP_PATHS_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
+
+#: Services whose bare name is not a hostname. A model asked for "spotify"
+#: has no reason to know it needs a suffix, or which one, and prefixing the
+#: word as it stands opens ``https://spotify`` -- a domain that does not
+#: exist, which from the speaker's side looks exactly like being ignored.
+_KNOWN_SITES = {
+    "spotify": "https://open.spotify.com",
+    "youtube": "https://www.youtube.com",
+    "gmail": "https://mail.google.com",
+    "google": "https://www.google.com",
+    "netflix": "https://www.netflix.com",
+    "github": "https://github.com",
+    "reddit": "https://www.reddit.com",
+    "facebook": "https://www.facebook.com",
+    "instagram": "https://www.instagram.com",
+    "amazon": "https://www.amazon.com",
+    "twitter": "https://x.com",
+    "wikipedia": "https://www.wikipedia.org",
+    "maps": "https://maps.google.com",
+    "drive": "https://drive.google.com",
+}
+
+#: What people ask for when they are not naming a program. "Music" is not
+#: installed anywhere and neither is "mail", but there is a sensible place
+#: to take both -- and without one the tool answers with an error, which the
+#: model then narrates instead of doing anything. Only names with one
+#: obvious destination belong here: a confident answer to an ambiguous
+#: request is worse than an honest refusal.
+_CATEGORY_SITES = {
+    "music": "https://open.spotify.com",
+    "song": "https://open.spotify.com",
+    "songs": "https://open.spotify.com",
+    "video": "https://www.youtube.com",
+    "videos": "https://www.youtube.com",
+    "movie": "https://www.netflix.com",
+    "movies": "https://www.netflix.com",
+    "tv": "https://www.netflix.com",
+    "mail": "https://mail.google.com",
+    "email": "https://mail.google.com",
+    "chat": "https://chatgpt.com",
+    "photos": "https://photos.google.com",
+    "news": "https://news.google.com",
+}
+
+
+def _site_for(name: str) -> str | None:
+    """The address a bare word stands for, or ``None`` if it names no site."""
+    key = (name or "").strip().casefold()
+    return _KNOWN_SITES.get(key) or _CATEGORY_SITES.get(key)
 
 
 class ControlError(RuntimeError):
@@ -170,7 +224,10 @@ def open_url(url: str) -> str:
         if scheme not in ("http", "https"):
             raise ControlError(f"only http and https can be opened, got {scheme!r}")
     else:
-        target = "https://" + target
+        # A bare word is a service before it is a host: "spotify" names a
+        # player, not a domain, and inventing the suffix for it is not
+        # something a small model can be trusted to get right every time.
+        target = _site_for(target) or "https://" + target
 
     try:
         _launch_url(target)
@@ -179,6 +236,126 @@ def open_url(url: str) -> str:
     except Exception as exc:  # noqa: BLE001 - the OS reports these unevenly
         raise ControlError(f"could not open {target}: {exc}") from exc
     return f"Opened {target} in the browser."
+
+
+def _app_paths_entries() -> list[tuple[str, str]]:
+    """``(name, path)`` for every program registered under App Paths."""
+    if os.name != "nt":  # pragma: no cover - POSIX has no registry
+        return []
+    try:
+        import winreg
+    except ImportError:  # pragma: no cover - Windows always ships it
+        return []
+
+    entries: list[tuple[str, str]] = []
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            root = winreg.OpenKey(hive, _APP_PATHS_KEY)
+        except OSError:
+            continue
+        with root:
+            count = winreg.QueryInfoKey(root)[0]
+            for index in range(count):
+                try:
+                    subkey = winreg.EnumKey(root, index)
+                    with winreg.OpenKey(root, subkey) as key:
+                        raw, _kind = winreg.QueryValueEx(key, "")
+                except OSError:  # pragma: no cover - racing uninstall
+                    continue
+                path = Path(raw.strip('"')).expanduser() if raw else None
+                if path and path.exists():
+                    entries.append((Path(subkey).stem, str(path)))
+    return entries
+
+
+def _windows_apps_entries() -> list[tuple[str, str]]:
+    """``(name, path)`` for Store apps, which publish execution aliases.
+
+    A Store app has no installer directory and no App Paths entry: its only
+    launchable handle on disk is a zero-byte reparse point under
+    ``WindowsApps``. Spotify is installed that way on this machine, so
+    without this source "open Spotify" would have nothing to find.
+    """
+    base = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WindowsApps"
+    if not base.is_dir():
+        return []
+    try:
+        return [(p.stem, str(p)) for p in base.glob("*.exe")]
+    except OSError:  # pragma: no cover - unreadable alias directory
+        return []
+
+
+def _start_menu_entries() -> list[tuple[str, str]]:
+    """``(name, path)`` for Start Menu shortcuts, walked last of the three.
+
+    It is the only source that reads the disk, and the slowest, so the two
+    registry-backed ones get their chance first.
+    """
+    roots = [
+        Path(os.environ.get("APPDATA", ""))
+        / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+        Path(os.environ.get("PROGRAMDATA", ""))
+        / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+    ]
+    entries: list[tuple[str, str]] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            entries.extend((p.stem, str(p)) for p in root.rglob("*.lnk"))
+        except OSError:  # pragma: no cover - unreadable Start Menu
+            continue
+    return entries
+
+
+def _find_program(wanted: str) -> str | None:
+    """The path of an installed program named *wanted*, or ``None``.
+
+    An exact match wins over a loose one **across all three sources**, not
+    within each: this machine has ``spotify_cli.exe`` in App Paths and
+    ``Spotify.exe`` as a Store alias, and scanning source by source for a
+    substring would return the command-line tool when the user meant the
+    player. Loose matching stays, because nobody says "Google Chrome" out
+    loud when they mean Chrome.
+    """
+    needle = wanted.casefold()
+    loose: str | None = None
+    for entries in (_app_paths_entries(), _windows_apps_entries(),
+                    _start_menu_entries()):
+        for key, path in entries:
+            if key.casefold() == needle:
+                return path
+            if loose is None and needle and needle in key.casefold():
+                loose = path
+    return loose
+
+
+def open_app(name: str) -> str:
+    """Launch an installed program by name, or reach its website if absent.
+
+    "Open Spotify" is a request for a program, and on a machine where
+    Spotify is installed the desktop app is what is meant -- a browser tab
+    with the player in it is not the same thing. When nothing of that name
+    is installed the request is still answered rather than refused: the
+    known website for the name is opened instead, because a reply of "I
+    could not find it" is the one outcome that helps nobody.
+    """
+    wanted = (name or "").strip().strip('"')
+    if not wanted:
+        raise ControlError("no program name given")
+
+    found = _find_program(wanted)
+    if found:
+        try:
+            _launch(found)
+        except Exception as exc:  # noqa: BLE001 - the OS reports these unevenly
+            raise ControlError(f"could not start {wanted}: {exc}") from exc
+        return f"Opened {Path(found).stem}."
+
+    site = _site_for(wanted)
+    if site:
+        return f"{open_url(site)} (no {wanted} program is installed here)"
+    raise ControlError(f"no program named {wanted!r} is installed here")
 
 
 def open_file(path: str, workspace: Path) -> str:

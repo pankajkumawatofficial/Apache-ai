@@ -10,7 +10,7 @@ Say **"Apache, …"** out loud, or just type. It answers with a voice.
 
 | Capability | How |
 |---|---|
-| **Tool-calling agent** | `langchain.agents.create_agent` with a calculator, Python sandbox, file tools, document search, web search and a clock |
+| **Tool-calling agent** | `langchain.agents.create_agent` with a calculator, Python sandbox, file tools, document search, web search, a clock, and `open_app` / `open_url` for starting programs and sites |
 | **Conversation memory** | LangGraph `MemorySaver` checkpointer, one thread per session |
 | **Chat with your documents (RAG)** | Upload text/PDF → chunked → `OllamaEmbeddings` + cosine retrieval, with an automatic TF-IDF fallback when no embedding model is pulled |
 | **Code interpreter sandbox** | `subprocess` running `python -I` with a timeout, no stdin and bounded output |
@@ -337,6 +337,23 @@ so "open YouTube" does not land in whatever browser happens to be the
 default. On this machine that default is Edge. The system's own browser is
 the fallback when there is no Chrome to be found.
 
+**Opening something means doing it.** "Open Spotify" used to come back as a
+run of questions instead of a running player. Four things were wrong.
+There was no tool for programs at all, so `open_app` now searches App Paths,
+the execution aliases Store apps publish under `WindowsApps` (Spotify on this
+machine exists *only* there — it has no installer directory and no App Paths
+entry), and the Start Menu. An exact match is preferred over a loose one
+**across all three sources**, because `App Paths` holds `spotify_cli.exe` — a
+command-line tool — and scanning source by source would have found that
+first. And a name installed nowhere still opens something: `spotify` and
+thirteen other bare words resolve to a real address, `music`, `mail` and the
+rest to a category's own site, so a fallback is an answer rather than an
+error the model then narrates. The fourth thing was the system prompt, which
+said nothing about opening anything and never told it to act rather than
+ask. Its opening paragraph now does — without quoting an example of the
+wrong reply, which the 1.7-billion-parameter model reproduced verbatim the
+first time it was tried.
+
 **Pruning must not outrun playback.** The clip store keeps the newest twenty
 files, but the queue and the clip currently playing are exactly the files that
 must survive — trimming one of those deletes a reply that was written,
@@ -519,6 +536,8 @@ its own system applications — use the Windows Security toggle instead.
 | `Cannot reach Ollama` | Start it: `ollama serve` (or launch the Ollama app) |
 | `model '…' not found` | `ollama pull <model>` |
 | Tools never fire | Use a tool-calling model; `qwen3:8b` never skips them, the default `qwen3:1.7b` occasionally does |
+| It keeps asking instead of doing | The first paragraph of the built-in system prompt is the instruction to act and then confirm in a sentence. `APACHE_SYSTEM_PROMPT` replaces the prompt in its entirety, so an override loses that paragraph and this symptom comes straight back |
+| `Open Spotify` reports no such program | `open_app` searches App Paths, then the `WindowsApps` aliases, then the Start Menu — in that order, but an exact name wins over a loose match whichever source it is in. Anything still missing opens its website instead |
 | Documents answer weakly | `ollama pull nomic-embed-text`, then re-upload |
 | No wake word response | Check the **Voice** panel state; the mic may be muted, stopped, or have hit repeated STT failures. Note the wake word is **optional by default** — tick **Require the wake word** (or `APACHE_WAKE_REQUIRED=1`) only if you want it back |
 | `Speech recognition failed` repeatedly | The listener stops after 5 consecutive failures to avoid spinning; restart it with the mic button |

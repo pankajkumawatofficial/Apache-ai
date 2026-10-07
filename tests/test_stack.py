@@ -55,6 +55,7 @@ EXPECTED_TOOLS = {
     "search_documents",
     "current_datetime",
     "open_url_tool",
+    "open_app_tool",
     "open_file_tool",
     "web_search",
 }

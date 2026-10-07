@@ -343,7 +343,9 @@ def test_computer_control() -> None:
     launched: list[object] = []
     spawned: list[list[str]] = []
     real_browser_for_urls = control.browser_for_urls
-    originals = (control._launch, control._spawn, control.browser_for_urls)
+    originals = (control._launch, control._spawn, control.browser_for_urls,
+                 control._app_paths_entries, control._windows_apps_entries,
+                 control._start_menu_entries)
     control._launch = launched.append
     control._spawn = spawned.append
     control.browser_for_urls = lambda: None
@@ -436,8 +438,85 @@ def test_computer_control() -> None:
         check("a folder opens through the same seam",
               str(workspace / "docs") in [str(x) for x in launched],
               repr(launched[-3:]))
+
+        # Launching a program. "Open Spotify" is the request that arrived as
+        # Apache asking questions instead of doing it, and the search has to
+        # get this machine right: App Paths holds spotify_cli.exe, which is
+        # a command-line tool, while the player itself is a Store alias.
+        control._app_paths_entries = lambda: [
+            ("spotify_cli", r"C:\cli\spotify_cli.exe"),
+            ("notepad", r"C:\Windows\notepad.exe"),
+        ]
+        control._windows_apps_entries = lambda: [
+            ("Spotify", r"C:\alias\Spotify.exe"),
+        ]
+        control._start_menu_entries = lambda: [
+            ("Google Chrome", r"C:\sm\Google Chrome.lnk"),
+        ]
+
+        control.open_app("spotify")
+        check("an exact name beats a loose match in an earlier source",
+              str(launched[-1]).endswith("Spotify.exe"), repr(launched[-1]))
+        check("and it never went near a browser",
+              not str(launched[-1]).startswith("http"), repr(launched[-1]))
+
+        control.open_app("SPOTIFY")
+        check("matching ignores case",
+              str(launched[-1]).endswith("Spotify.exe"), repr(launched[-1]))
+
+        control.open_app("chrome")
+        check("a loose name finds a shortcut",
+              str(launched[-1]).endswith("Google Chrome.lnk"),
+              repr(launched[-1]))
+
+        # Nothing installed: the service's own page still answers the
+        # request, because "I could not find it" helps nobody.
+        control._app_paths_entries = lambda: []
+        control._windows_apps_entries = lambda: []
+        control._start_menu_entries = lambda: []
+        control.open_app("spotify")
+        check("an uninstalled service opens its website",
+              str(launched[-1]) == "https://open.spotify.com",
+              repr(launched[-1]))
+        check("and the website is named in the reply",
+              "spotify" in control.open_app("spotify"), "not said")
+
+        try:
+            control.open_app("definitely-not-installed")
+            outcome = "NOT REFUSED"
+        except ControlError as exc:
+            outcome = str(exc)
+        check("an unknown program is reported, not guessed at",
+              "no program named" in outcome, outcome)
+
+        # "Put on some music" reaches here as open_app("Music"), which is
+        # installed nowhere; a category with one obvious destination still
+        # opens it rather than answering with an error the model then
+        # narrates instead of acting.
+        control.open_app("music")
+        check("a category with no program opens its service",
+              str(launched[-1]) == "https://open.spotify.com",
+              repr(launched[-1]))
+        control.open_url("mail")
+        check("the same for a bare category name",
+              launched[-1] == "https://mail.google.com", repr(launched[-1]))
+
+        try:
+            control.open_app("   ")
+            outcome = "NOT REFUSED"
+        except ControlError as exc:
+            outcome = str(exc)
+        check("an empty program name is refused",
+              "no program name" in outcome, outcome)
+
+        # The bare word must not become a domain that does not exist.
+        control.open_url("spotify")
+        check("a bare service name opens the real site",
+              launched[-1] == "https://open.spotify.com", repr(launched[-1]))
     finally:
-        control._launch, control._spawn, control.browser_for_urls = originals
+        (control._launch, control._spawn, control.browser_for_urls,
+         control._app_paths_entries, control._windows_apps_entries,
+         control._start_menu_entries) = originals
         shutil.rmtree(workspace, ignore_errors=True)
 
 
