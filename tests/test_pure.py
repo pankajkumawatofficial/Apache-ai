@@ -520,14 +520,17 @@ def test_computer_control() -> None:
         check("an unknown program is reported, not guessed at",
               "no program named" in outcome, outcome)
 
-        # "Put on some music" reaches here as open_app("Music"), which is
-        # installed nowhere; a category with one obvious destination still
-        # opens it rather than answering with an error the model then
-        # narrates instead of acting.
+        # "Open music" names no program: it reaches a website, and a
+        # player's front page sits there in silence. The audible categories
+        # play instead, because opening was the means and hearing something
+        # was the request.
+        control.find_video = lambda q: ("https://www.youtube.com/watch?v=abc123",
+                                        "Bohemian Rhapsody")
         control.open_app("music")
-        check("a category with no program opens its service",
-              str(launched[-1]) == "https://open.spotify.com",
+        check("an audible category plays rather than opening a page",
+              str(launched[-1]) == "https://www.youtube.com/watch?v=abc123",
               repr(launched[-1]))
+        control.find_video = lambda q: None
         control.open_url("mail")
         check("the same for a bare category name",
               launched[-1] == "https://mail.google.com", repr(launched[-1]))
@@ -544,6 +547,16 @@ def test_computer_control() -> None:
         control.open_url("spotify")
         check("a bare service name opens the real site",
               launched[-1] == "https://open.spotify.com", repr(launched[-1]))
+        # Nor may a whole sentence: Chrome will happily open
+        # "https://play a song" and show a network error, which reads as
+        # Apache reaching for the wrong page instead of refusing it.
+        try:
+            control.open_url("play a song")
+            outcome = "NOT REFUSED"
+        except ControlError as exc:
+            outcome = str(exc)
+        check("a sentence is not handed to the browser",
+              "not a web address" in outcome, outcome)
 
         # Playing is not opening: a search page opens without a sound, so
         # only a watch page counts as having played something.
@@ -568,6 +581,28 @@ def test_computer_control() -> None:
         # Spotify can be pointed at a search but not told to press play --
         # that needs an account key. The reply has to say so rather than
         # leave the user waiting for music that was never started.
+        # The request arrives as the user's own sentence when it is recovered
+        # from a bare tool name, so the lead-in has to come off the front
+        # before it reaches a search: "play a song" is a worse query than
+        # "a song" by exactly that one word, and "i want to hear music" is
+        # worse than "music".
+        seen: list[str] = []
+        control.find_video = lambda q: seen.append(q) or None
+        for request in ("play a song", "put on a song", "start some music",
+                        "i want to hear music", "open music"):
+            control.play_media(request)
+        check("the lead-in is stripped before the search",
+              seen == ["a song", "a song", "some music", "music", "music"],
+              repr(seen))
+        check("and the results page still opens with no match",
+              str(launched[-1]).startswith(
+                  "https://www.youtube.com/results?search_query="),
+              repr(launched[-1]))
+        control.find_video = lambda q: None
+
+        # Spotify can be pointed at a search but not told to press play --
+        # that needs an account key. The reply has to say so rather than
+        # leave the user waiting for music that was never started.
         outcome = control.play_media("play shape of you on spotify")
         check("a Spotify request opens the app on a search",
               str(launched[-1]).startswith("spotify:search:"),
@@ -575,7 +610,7 @@ def test_computer_control() -> None:
         check("and says the track still needs picking",
               "Pick the track" in outcome, repr(outcome))
         check("with the filler words out of the search",
-              str(launched[-1]) == "spotify:search:play%20shape%20of%20you",
+              str(launched[-1]) == "spotify:search:shape%20of%20you",
               repr(launched[-1]))
 
         try:

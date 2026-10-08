@@ -368,6 +368,18 @@ honest exception: the desktop app can be *pointed* at a search through its
 machine has not got, so the reply says the track still has to be picked
 rather than implying music had begun.
 
+Four things keep that path actually reaching the speakers. The request is
+stripped of its lead-in — `play`, `put on`, `start`, `I want to hear` —
+because the argument often arrives as the user's own sentence rather than a
+title, and "play a song" is a worse search than "a song". `open_app` says in
+its result that a player it just started is not playing anything, so the
+model can see the gap rather than assume the request is done. The prompt
+states that music is something to hear rather than something to open. And
+`open_app` itself hands the audible categories — `music`, `song`, `songs` —
+straight to `play_media`: they install no program anywhere, so they used to
+fall through to a player's front page that sits in silence. "Open music" was
+a request for sound, and opening was only ever the means.
+
 **Only words reach the speaker.** A model closing a reply with a musical
 note puts an emoji in the transcript, and a synthesiser reads that code
 point aloud as though it spelled something. `clean_for_speech` now drops
@@ -397,6 +409,25 @@ brace and quote spoken. `_run_text_tool_call` recognises the shape, runs
 the tool, and answers with its result, so a fumbled call still does the
 thing rather than narrating itself. The shape is specific enough that no
 sentence fits it by accident.
+
+Two more shapes turn up once you watch it happen. The name alone, with the
+arguments never written down — "play a song", "put on a song", "start some
+music" and "i want to hear music" each answered with the single word
+`play_media`, spoken back and starting nothing. That is treated as a call
+too, with the user's own request as the one argument the tool needs. And
+the name has to be matched the way the *prompt* spells it: it teaches
+`open_app` and `play_media` while LangChain registers `open_app_tool` and
+`play_media_tool`, so a hand-written call in the shorter spelling would
+otherwise find no tool and fall through to the speaker.
+
+**The reply is the answer, not the working.** Small models narrate their own
+turn — "Okay, let's see. You asked to open music, and I called the
+play_media_tool with 'music' as the request…" — and never reach the sentence
+that was wanted. That text is streamed as it arrives, so it would have been
+spoken word for word. Ollama is asked for no thinking (`APACHE_REASONING` is
+off, and turning it on leaves qwen3 reasoning to a halt with empty content),
+but a model can still write commentary into ordinary content, so the prompt
+rules say plainly that the reply is only the sentence to say aloud.
 
 **Pruning must not outrun playback.** The clip store keeps the newest twenty
 files, but the queue and the clip currently playing are exactly the files that
@@ -586,7 +617,8 @@ its own system applications — use the Windows Security toggle instead.
 | No wake word response | Check the **Voice** panel state; the mic may be muted, stopped, or have hit repeated STT failures. Note the wake word is **optional by default** — tick **Require the wake word** (or `APACHE_WAKE_REQUIRED=1`) only if you want it back |
 | `Speech recognition failed` repeatedly | The listener stops after 5 consecutive failures to avoid spinning; restart it with the mic button |
 | It hears the wrong word | The default is `small.en` at beam width 5. It downloads itself on first use (~466 MB, check `run.py --check`), and `APACHE_WHISPER_MODEL=base.en` trades accuracy back for speed. `APACHE_WHISPER_BEAM=1` does the same for decoding width |
-| It opens something and no sound follows | For a song or video use `play_media`, which resolves to a page that starts on its own — `open_url` only opens a page. For Spotify's own app a track cannot be started without an account key, so a search opens and one tap starts it |
+| It opens something and no sound follows | `play_media` resolves to a page that starts on its own — `open_url` only opens a page, and a player opened on its own makes no sound. The audible categories (`open music`) reach `play_media` rather than a front page. For Spotify's own app a track cannot be started without an account key, so a search opens and one tap starts it |
+| It reads a tool name back at you | The model wrote a call instead of making it. `_run_text_tool_call` runs the name even with no arguments written down — filling them from the request — and resolves the prompt's spelling (`play_media`) to LangChain's (`play_media_tool`). `qwen3:8b` writes fewer of these than the default `qwen3:1.7b` |
 | No spoken replies | Untick **Speak replies aloud** only if you meant to. Otherwise run `run.py --check` and read the **Speech models** line — a missing Piper voice fails silently, and Apache looks perfectly healthy while saying nothing |
 | Nothing is spoken until I click something | Chrome blocks audio that starts without a gesture, and Apache's first words are the greeting. The page says so — **SOUND BLOCKED** across the top — until you click once, after which the origin is unlocked for good and every later reply plays on its own |
 | Replies stop arriving when I switch to another tab | Fixed in `app/ui.py::_page_js()` (see *Design notes*). If it still happens, check that a content blocker is not stripping the injected script |

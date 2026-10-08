@@ -92,6 +92,12 @@ def _site_for(name: str) -> str | None:
     return _KNOWN_SITES.get(key) or _CATEGORY_SITES.get(key)
 
 
+#: Categories whose obvious destination is a player's front page, which sits
+#: there in silence. "Open music" is a request for sound, not for a page to
+#: look at, so these are handed to the tool that makes noise instead.
+_AUDIBLE_CATEGORIES = ("music", "song", "songs")
+
+
 class ControlError(RuntimeError):
     """Raised when the system would not or could not perform an action."""
 
@@ -232,7 +238,17 @@ def open_url(url: str) -> str:
         # A bare word is a service before it is a host: "spotify" names a
         # player, not a domain, and inventing the suffix for it is not
         # something a small model can be trusted to get right every time.
-        target = _site_for(target) or "https://" + target
+        site = _site_for(target)
+        if site:
+            target = site
+        elif any(ch.isspace() for ch in target):
+            # A sentence is not an address. Chrome accepts almost anything
+            # after "https://" and shows a network error for it, which reads
+            # as Apache opening the wrong page rather than refusing input
+            # that was never a URL to begin with.
+            raise ControlError(f"{target!r} is not a web address")
+        else:
+            target = "https://" + target
 
     try:
         _launch_url(target)
@@ -335,6 +351,28 @@ def _find_program(wanted: str) -> str | None:
     return loose
 
 
+#: Programs that only make noise once something is chosen inside them.
+_SILENT_IF_ONLY_OPENED = ("spotify", "music", "itunes", "vlc", "player", "groove")
+
+
+def _opened(label: str) -> str:
+    """Result of starting a program whose whole purpose is to make sound.
+
+    Launching a player is half of a music request, and this string is what
+    the model reads to decide whether the turn is finished. Naming the gap
+    lets it chain ``play_media`` itself when the user did ask for music, and
+    stop when they only asked for the program -- the alternative is a player
+    sitting open and silent, which is what "it opens Spotify but does not
+    play" looked like from the other side of the screen.
+    """
+    if not any(word in label.casefold() for word in _SILENT_IF_ONLY_OPENED):
+        return f"Opened {label}."
+    # Factual on purpose: a tool result naming a tool is a tool name that
+    # ends up read back aloud, and the prompt already says what to do when
+    # something was meant to be heard.
+    return f"Opened {label}, and nothing is playing on its own yet."
+
+
 def open_app(name: str) -> str:
     """Launch an installed program by name, or reach its website if absent.
 
@@ -355,17 +393,39 @@ def open_app(name: str) -> str:
             _launch(found)
         except Exception as exc:  # noqa: BLE001 - the OS reports these unevenly
             raise ControlError(f"could not start {wanted}: {exc}") from exc
-        return f"Opened {Path(found).stem}."
+        return _opened(Path(found).stem)
+
+    if wanted.casefold() in _AUDIBLE_CATEGORIES:
+        # Nothing of that name is installed and its website would only open,
+        # so this is where "open music" lands -- and opening is the means,
+        # not the request. Playing it answers what was actually asked.
+        return play_media(wanted)
 
     site = _site_for(wanted)
     if site:
-        return f"{open_url(site)} (no {wanted} program is installed here)"
+        note = f"no {wanted} program is installed here"
+        if any(word in wanted.casefold() for word in _SILENT_IF_ONLY_OPENED):
+            note += ", and it will not play on its own"
+        return f"{open_url(site)} ({note})"
     raise ControlError(f"no program named {wanted!r} is installed here")
 
 
 #: The words around what is actually meant when a request names Spotify.
 _SPOTIFY_FILLER = re.compile(r"\b(on|in|with|from|using|the|app|please|spotify)\b",
                              re.IGNORECASE)
+
+#: The way a request is wrapped when it is handed over whole instead of being
+#: parsed down to a title first. Model-supplied arguments usually arrive
+#: already stripped ("shape of you"); the ones recovered from a bare tool
+#: name arrive as the user's own sentence, and "play a song" is a poor search
+#: term while "a song" is a perfectly good one. Applied once, so a title that
+#: really does begin with "Play" survives.
+_PLAY_LEAD_IN = re.compile(
+    r"^\s*(?:i (?:would |'d |really )?(?:like|love|want) to"
+    r"|(?:can|could|would|will) you|let(?:'s| us)|please|just)?"
+    r"\s*(?:play|put on|listen to|stream|start|hear|open)\s+",
+    re.IGNORECASE,
+)
 
 
 def play_media(request: str) -> str:
@@ -385,6 +445,7 @@ def play_media(request: str) -> str:
     text = (request or "").strip().strip('"')
     if not text:
         raise ControlError("nothing to play was given")
+    text = _PLAY_LEAD_IN.sub("", text, count=1).strip() or text
 
     if "spotify" in text.casefold():
         terms = " ".join(_SPOTIFY_FILLER.sub(" ", text).split())

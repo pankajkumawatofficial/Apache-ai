@@ -113,13 +113,34 @@ def test_tool_registry() -> None:
     check("every tool carries a description", not undescribed,
           f"undescribed={undescribed}")
 
+    # The bare-name recovery fills a tool's one argument from the user's own
+    # request, which means reading the schema the model was actually shown.
+    # BaseTool.args is only the properties mapping and leaves the defaults
+    # out, so reading it instead makes every parameter look mandatory.
+    from app.agent import _sentence_arguments
+
+    player = next((t for t in tools if getattr(t, "name", "") == "play_media_tool"),
+                  None)
+    check("the player tool is built", player is not None, "")
+    if player is not None:
+        check("a real tool's one argument can be filled in",
+              _sentence_arguments(player, "a song") == {"request": "a song"},
+              repr(_sentence_arguments(player, "a song")))
+    folder = next((t for t in tools if getattr(t, "name", "") == "list_files"), None)
+    if folder is not None:
+        check("a defaulted argument is not demanded",
+              _sentence_arguments(folder, "a song") == {},
+              repr(_sentence_arguments(folder, "a song")))
+
 
 def test_text_tool_call() -> None:
     """A tool call written out as prose is still a tool call.
 
     qwen3 formats some calls itself -- the tool name, then its arguments as
     JSON -- and the runtime has already decided by then that it is looking
-    at prose. Left alone, Apache reads the whole thing aloud.
+    at prose. Left alone, Apache reads the whole thing aloud. It also leaves
+    the arguments off entirely: "play a song", "put on a song" and "start
+    some music" each answered with the bare word "play_media".
     """
     print("text tool calls")
     from app.agent import _run_text_tool_call
@@ -128,6 +149,9 @@ def test_text_tool_call() -> None:
 
     class _Tool:
         name = "play_media_tool"
+        # BaseTool.args is the properties mapping, not the whole schema --
+        # the shape the real tools on this list describe themselves with.
+        args = {"request": {"title": "Request", "type": "string"}}
 
         def invoke(self, args):
             ran.append(args)
@@ -148,8 +172,35 @@ def test_text_tool_call() -> None:
         'play_media_tool {"request": "despacito"}', [tool])
     check("the same on one line", name == "play_media_tool", repr(name))
 
+    check("the prompt's own spelling of the tool reaches it",
+          _run_text_tool_call(
+              'play_media\n{"request": "despacito"}', [tool]) is not None, "")
+
+    ran.clear()
+    name, args, _result = _run_text_tool_call("play_media", [tool], "a song")
+    check("a bare tool name runs with the request as its argument",
+          name == "play_media_tool"
+          and args == {"request": "a song"}
+          and ran == [{"request": "a song"}], f"{name=} {args=} {ran=}")
+
+    check("but not with nothing to pass it",
+          _run_text_tool_call("play_media", [tool]) is None, "")
+    check("and not when the name is not one of the tools",
+          _run_text_tool_call("wibble", [tool], "a song") is None, "")
+
+    class _TwoArgs:
+        name = "pair_tool"
+        args = {"a": {"type": "string"}, "b": {"type": "string"}}
+
+        def invoke(self, args):  # pragma: no cover - must never be reached
+            raise AssertionError("two arguments cannot be guessed")
+
+    check("a tool needing two arguments is left to the model",
+          _run_text_tool_call("pair", [tool, _TwoArgs()], "a song") is None, "")
+
     check("an ordinary sentence is left alone",
-          _run_text_tool_call("I opened Spotify for you.", [tool]) is None, "")
+          _run_text_tool_call("I opened Spotify for you.", [tool], "play a song")
+          is None, "")
     check("broken JSON is left alone",
           _run_text_tool_call("play_media_tool\n{oops}", [tool]) is None, "")
     check("a tool that is not registered is left alone",
@@ -159,6 +210,7 @@ def test_text_tool_call() -> None:
 
     class _Boom:
         name = "calculator"
+        args = {"expression": {"type": "string"}}
 
         def invoke(self, args):
             raise ValueError("bad expression")
